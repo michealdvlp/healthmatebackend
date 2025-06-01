@@ -1,13 +1,9 @@
-# Flask and Web Server
 flask==2.3.2
 flask-cors==4.0.0
-
-# OpenAI Integration (older stable version for Vercel)
 openai==0.27.0
-
-# Pinecone Vector Database
 pinecone==5.0.0
-
-# Utilities
+fastapi==0.104.1
+uvicorn==0.24.0
+pydantic==2.5.0
 python-dotenv==1.0.0
 requests==2.31.0
