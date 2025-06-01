@@ -1,4 +1,19 @@
-import os
+def is_red_flag(full_text: str, severity: int = 0, symptoms: List[str] = None) -> bool:
+    """Check if text contains any red-flag keywords or emergency symptom combinations"""
+    lt = full_text.lower()
+    
+    # Check individual red flags
+    for rf in RED_FLAGS:
+        if rf in lt:
+            logger.info(f"Red flag detected: {rf}")
+            return True
+    
+    # Check emergency symptom combinations
+    if symptoms:
+        symptoms_lower = [s.lower() for s in symptoms]
+        
+        # Chest pain + breathing issues = emergency
+        has_chest_pain = any("chest pain" in simport os
 import json
 import logging
 import re
@@ -44,7 +59,10 @@ RED_FLAGS = [
     "head trauma", "neck trauma", "high fever with stiff neck", "uncontrolled vomiting",
     "severe allergic reaction", "anaphylaxis", "difficulty breathing", "persistent cough with blood",
     "severe abdominal pain", "sudden vision loss", "chest tightness with sweating",
-    "blood in urine", "inability to pass urine", "sharp abdominal pain", "intermenstrual bleeding"
+    "blood in urine", "inability to pass urine", "sharp abdominal pain", "intermenstrual bleeding",
+    # Add more emergency combinations
+    "chest pain", "shortness of breath", "severe chest pain", "chest pressure", "heart attack",
+    "severe shortness of breath", "cannot breathe", "crushing pain"
 ]
 
 # -----------------------------------
@@ -202,30 +220,63 @@ def extract_symptoms_comprehensive(description: str) -> Dict:
         logger.error(f"Error extracting symptoms: {e}")
         return {"symptoms": [], "duration": None, "severity": 0}
 
-def is_red_flag(full_text: str, severity: int = 0) -> bool:
-    """Check if text contains any red-flag keywords"""
+def is_red_flag(full_text: str, severity: int = 0, symptoms: List[str] = None) -> bool:
+    """Check if text contains any red-flag keywords or emergency symptom combinations"""
     lt = full_text.lower()
+    
+    # Check individual red flags in text
     for rf in RED_FLAGS:
         if rf in lt:
-            logger.info(f"Red flag detected: {rf}")
+            logger.info(f"Red flag detected in text: {rf}")
             return True
-    if severity >= 8 and any(term in lt for term in ["abdominal pain", "intermenstrual bleeding"]):
-        logger.info(f"Red flag detected: high severity {severity} with critical symptom.")
+    
+    # Check emergency symptom combinations
+    if symptoms:
+        symptoms_lower = [s.lower() for s in symptoms]
+        
+        # Chest pain + breathing issues = emergency
+        has_chest_pain = any("chest pain" in s or "chest" in s for s in symptoms_lower)
+        has_breathing_issue = any("shortness of breath" in s or "difficulty breathing" in s or "breathless" in s for s in symptoms_lower)
+        
+        if has_chest_pain and has_breathing_issue:
+            logger.info(f"Emergency combination detected: chest pain + breathing issue")
+            return True
+        
+        # Severe chest pain alone = emergency
+        if any("severe chest pain" in s or "crushing chest pain" in s for s in symptoms_lower):
+            logger.info(f"Emergency detected: severe chest pain")
+            return True
+            
+        # Check for other emergency combinations
+        emergency_symptoms = ["chest pain", "severe pain", "difficulty breathing", "shortness of breath", "unconscious", "seizure"]
+        symptom_matches = sum(1 for symptom in symptoms_lower for emergency in emergency_symptoms if emergency in symptom)
+        
+        if symptom_matches >= 2:
+            logger.info(f"Emergency detected: {symptom_matches} emergency symptoms")
+            return True
+    
+    # High severity check
+    if severity >= 8:
+        logger.info(f"Emergency detected: high severity {severity}")
         return True
+    
     return False
 
 def should_query_pinecone_database(symptoms: List[str], severity: int = 0, full_text: str = "") -> bool:
     """Decide whether to query Pinecone"""
     symptom_count = len(symptoms)
     
-    if is_red_flag(full_text, severity):
+    # Always query for emergencies
+    if is_red_flag(full_text, severity, symptoms):
         logger.info("Emergency red flag → querying Pinecone.")
         return True
 
-    if symptom_count >= MIN_SYMPTOMS_FOR_PINECONE:
+    # Query if we have enough symptoms (lowered threshold for better UX)
+    if symptom_count >= 2:  # Lowered from 3 to 2
         logger.info(f"Sufficient symptoms ({symptom_count}) → querying Pinecone.")
         return True
 
+    # Query if user explicitly asks for conditions
     condition_keywords = [
         "what might be", "what could be", "what is", "infection", "condition",
         "disease", "diagnosis", "what's wrong", "what do i have"
@@ -403,11 +454,13 @@ def triage_main(description: str, thread_id: Optional[str] = None) -> Dict:
         symptoms = symptom_data["symptoms"]
         severity = symptom_data["severity"]
         
-        # Check for emergency
-        is_emergency = is_red_flag(description, severity)
+        # Check for emergency (pass symptoms for better detection)
+        is_emergency = is_red_flag(description, severity, symptoms)
         
-        # Determine if we should query Pinecone
+        # Determine if we should query Pinecone (pass symptoms for better detection)
         should_query = should_query_pinecone_database(symptoms, severity, description)
+        
+        logger.info(f"Analysis: symptoms={symptoms}, severity={severity}, is_emergency={is_emergency}, should_query={should_query}")
         
         possible_conditions = []
         if should_query and PINECONE_API_KEY:
@@ -417,10 +470,15 @@ def triage_main(description: str, thread_id: Optional[str] = None) -> Dict:
                 matches = query_pinecone_index(query_text, symptoms)
                 if matches:
                     possible_conditions = rank_conditions(matches, symptoms)
+                    logger.info(f"Found {len(possible_conditions)} conditions from Pinecone")
                 else:
                     logger.warning("No Pinecone matches found")
             except Exception as e:
                 logger.error(f"Pinecone query failed: {e}")
+        elif not PINECONE_API_KEY:
+            logger.warning("Pinecone API key not available")
+        else:
+            logger.info("Skipping Pinecone query (should_query=False)")
 
         # Generate response text
         symptoms_text = ", ".join(symptoms) if symptoms else "your symptoms"
