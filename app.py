@@ -1,9 +1,9 @@
 import os
-import sys
 import json
 import logging
 import asyncio
 import uuid
+import re
 from datetime import datetime
 from flask import Flask, request, jsonify
 from flask_cors import CORS
@@ -23,34 +23,44 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 CORS(app, origins="*")
 
-# Check if we can import the secure testtriage
-TRIAGE_AVAILABLE = False
-try:
-    # Import the secure testtriage functions
-    from services.secure_testtriage import (
-        triage as secure_triage,
-        TriageRequest,
-        TriageResponse
-    )
-    TRIAGE_AVAILABLE = True
-    logger.info("✅ Secure triage service imported successfully")
-except ImportError as e:
-    logger.warning(f"⚠️  Could not import secure triage service: {e}")
-    logger.info("Will use basic triage fallback")
-
-# Alternative: Try to import OpenAI directly for basic functionality
+# Try to import OpenAI with version compatibility
 OPENAI_AVAILABLE = False
+openai_client = None
 try:
     import openai
-    from openai import AsyncOpenAI
-    OPENAI_AVAILABLE = bool(os.getenv("OPENAI_API_KEY"))
-    if OPENAI_AVAILABLE:
-        openai_client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-        logger.info("✅ OpenAI client available")
-except ImportError:
-    logger.warning("⚠️  OpenAI not available")
+    api_key = os.getenv("OPENAI_API_KEY")
+    if api_key:
+        # Use the synchronous client to avoid AsyncClient issues on Vercel
+        openai.api_key = api_key
+        OPENAI_AVAILABLE = True
+        logger.info("✅ OpenAI configured successfully")
+    else:
+        logger.warning("⚠️ OpenAI API key not provided")
+except ImportError as e:
+    logger.warning(f"⚠️ OpenAI not available: {e}")
 
-# Supported languages
+# Try to import Pinecone
+PINECONE_AVAILABLE = False
+pc = None
+index = None
+try:
+    from pinecone import Pinecone
+    api_key = os.getenv("PINECONE_API_KEY")
+    index_name = os.getenv("PINECONE_INDEX_NAME", "triage-index")
+    if api_key:
+        pc = Pinecone(api_key=api_key)
+        try:
+            index = pc.Index(index_name)
+            PINECONE_AVAILABLE = True
+            logger.info(f"✅ Pinecone configured successfully with index: {index_name}")
+        except Exception as e:
+            logger.warning(f"⚠️ Pinecone index '{index_name}' not accessible: {e}")
+    else:
+        logger.warning("⚠️ Pinecone API key not provided")
+except ImportError as e:
+    logger.warning(f"⚠️ Pinecone not available: {e}")
+
+# Configuration
 SUPPORTED_LANGUAGES = {
     "en": "English",
     "ig": "Igbo",
@@ -59,11 +69,12 @@ SUPPORTED_LANGUAGES = {
     "pcm": "Nigerian Pidgin"
 }
 
-# Emergency red flags for basic fallback
+# Emergency red flags
 RED_FLAGS = [
     "crushing chest pain", "difficulty breathing", "shortness of breath",
-    "severe bleeding", "loss of consciousness", "severe headache",
-    "stroke symptoms", "seizure", "severe allergic reaction"
+    "severe bleeding", "profuse bleeding", "loss of consciousness",
+    "severe headache", "stroke symptoms", "seizure", "severe allergic reaction",
+    "anaphylaxis", "bullet wound", "gunshot", "head trauma", "neck trauma"
 ]
 
 # Health facts database
@@ -82,20 +93,29 @@ HEALTH_FACTS = {
     ]
 }
 
-def extract_basic_symptoms(text):
-    """Basic symptom extraction for fallback"""
+# Simple conversation storage (in production, use Redis or database)
+conversation_threads = {}
+
+def extract_symptoms(text):
+    """Extract symptoms from text using keyword matching"""
     text_lower = text.lower()
     symptoms = []
     
     symptom_keywords = {
         'headache': ['headache', 'head pain', 'head hurt', 'migraine'],
-        'fever': ['fever', 'temperature', 'hot', 'chills'],
-        'cough': ['cough', 'coughing'],
-        'stomach pain': ['stomach pain', 'belly pain', 'abdominal pain'],
-        'nausea': ['nausea', 'nauseous', 'sick'],
-        'fatigue': ['tired', 'fatigue', 'exhausted', 'weak'],
+        'fever': ['fever', 'temperature', 'hot', 'chills', 'burning up'],
+        'cough': ['cough', 'coughing', 'hacking'],
+        'stomach pain': ['stomach pain', 'belly pain', 'abdominal pain', 'tummy ache'],
+        'nausea': ['nausea', 'nauseous', 'sick to stomach', 'queasy'],
+        'vomiting': ['vomiting', 'throwing up', 'vomit', 'puking'],
+        'diarrhea': ['diarrhea', 'loose stool', 'runny stool'],
+        'fatigue': ['tired', 'fatigue', 'exhausted', 'weak', 'weakness'],
+        'dizziness': ['dizzy', 'lightheaded', 'spinning'],
+        'sore throat': ['sore throat', 'throat pain', 'throat hurt'],
         'chest pain': ['chest pain', 'chest hurt', 'chest pressure'],
-        'shortness of breath': ['short of breath', 'difficulty breathing', 'can\'t breathe']
+        'shortness of breath': ['short of breath', 'difficulty breathing', 'can\'t breathe'],
+        'leg pain': ['leg pain', 'leg hurt', 'leg ache'],
+        'back pain': ['back pain', 'back hurt', 'back ache']
     }
     
     for symptom, keywords in symptom_keywords.items():
@@ -104,99 +124,222 @@ def extract_basic_symptoms(text):
     
     return symptoms
 
-def detect_emergency_basic(text):
-    """Basic emergency detection"""
+def detect_emergency(text):
+    """Detect emergency situations"""
     text_lower = text.lower()
     for flag in RED_FLAGS:
         if flag in text_lower:
+            logger.info(f"🚨 Emergency detected: {flag}")
             return True
     return False
 
-async def basic_openai_analysis(description):
-    """Basic OpenAI analysis when full triage isn't available"""
+def extract_duration(text):
+    """Extract duration information from text"""
+    text_lower = text.lower()
+    duration_patterns = [
+        r"for\s+(about\s+)?(\d+)\s+(day|hour|minute|week|month)s?",
+        r"(since|started|began)\s+(yesterday|today|\d+\s+(day|hour|week|month)s?\s+ago)",
+        r"(last|past)\s+(\d+)\s+(day|hour|week|month)s?"
+    ]
+    
+    for pattern in duration_patterns:
+        match = re.search(pattern, text_lower)
+        if match:
+            return match.group(0)
+    return None
+
+def assess_severity(text):
+    """Assess symptom severity from descriptive words"""
+    text_lower = text.lower()
+    severity_scores = {
+        "excruciating": 10, "unbearable": 10, "extremely painful": 10,
+        "severe": 8, "very painful": 8, "crushing": 8, "sharp": 8,
+        "painful": 6, "moderate": 6, "mild": 4, "slight": 2
+    }
+    
+    max_severity = 0
+    for term, score in severity_scores.items():
+        if term in text_lower:
+            max_severity = max(max_severity, score)
+    
+    # Check for numeric pain scale
+    pain_match = re.search(r"pain\s+(\d+)/10", text_lower)
+    if pain_match:
+        max_severity = max(max_severity, int(pain_match.group(1)))
+    
+    return max_severity
+
+def generate_openai_response(description, symptoms):
+    """Generate response using OpenAI (synchronous to avoid Vercel issues)"""
     if not OPENAI_AVAILABLE:
         return None
     
     try:
-        response = await openai_client.chat.completions.create(
-            model="gpt-4o-mini",
+        symptom_text = ", ".join(symptoms) if symptoms else "the reported symptoms"
+        
+        response = openai.ChatCompletion.create(
+            model="gpt-3.5-turbo",
             messages=[
                 {
                     "role": "system",
-                    "content": "You are a medical triage assistant. Analyze the symptoms and provide a helpful response. Be empathetic and recommend appropriate medical care."
+                    "content": "You are a medical triage assistant. Provide helpful, empathetic responses about health concerns. Always recommend consulting healthcare professionals for proper diagnosis and treatment. Be supportive but emphasize the importance of professional medical care."
                 },
                 {
                     "role": "user",
-                    "content": f"Patient describes: {description}"
+                    "content": f"A patient reports: {description}. The symptoms identified are: {symptom_text}. Please provide a helpful response."
                 }
             ],
             temperature=0.3,
             max_tokens=300
         )
+        
         return response.choices[0].message.content.strip()
     except Exception as e:
-        logger.error(f"OpenAI analysis failed: {e}")
+        logger.error(f"OpenAI request failed: {e}")
         return None
 
-def create_basic_response(description, symptoms, is_emergency):
-    """Create a basic triage response"""
-    if is_emergency:
-        return {
-            "text": "🚨 URGENT: Your symptoms suggest a medical emergency. Please call 112 immediately for emergency medical assistance.",
-            "possible_conditions": [
-                {"name": "Emergency Medical Condition", "description": "Your symptoms require immediate medical attention."}
-            ],
-            "safety_measures": [
-                "Call 112 immediately",
-                "Stay calm and don't panic",
-                "Have someone stay with you if possible"
-            ],
-            "triage": {"type": "hospital", "location": "Unknown"},
-            "send_sos": True,
-            "follow_up_questions": [],
-            "symptoms_count": len(symptoms),
-            "should_query_pinecone": False
-        }
+def generate_follow_up_questions(symptoms):
+    """Generate relevant follow-up questions based on symptoms"""
+    if not symptoms:
+        return ["How long have you been experiencing these symptoms?", "Have you tried any treatments?"]
     
-    symptom_text = ", ".join(symptoms) if symptoms else "your symptoms"
-    return {
-        "text": f"I understand you're experiencing {symptom_text}. It's important to monitor your symptoms and seek medical attention if they worsen or if you're concerned. For non-emergency medical concerns, consider visiting a clinic.",
-        "possible_conditions": [
-            {"name": "Common Health Issue", "description": f"Based on {symptom_text}, this could be a health concern that should be evaluated by a healthcare provider."}
-        ],
-        "safety_measures": [
+    questions = []
+    
+    if 'headache' in symptoms:
+        questions.append("Is the headache throbbing or constant?")
+        questions.append("Do you have sensitivity to light or sound?")
+    
+    if 'fever' in symptoms:
+        questions.append("Have you measured your temperature?")
+        questions.append("Are you experiencing chills or sweating?")
+    
+    if 'stomach pain' in symptoms:
+        questions.append("Is the pain sharp, cramping, or dull?")
+        questions.append("Have you eaten anything unusual recently?")
+    
+    if 'chest pain' in symptoms:
+        questions.append("Does the pain worsen with breathing or movement?")
+        questions.append("Do you have any shortness of breath?")
+    
+    # Default questions if no specific ones apply
+    if not questions:
+        questions = [
+            "How long have you been experiencing these symptoms?",
+            "Have the symptoms gotten better or worse over time?",
+            "Have you tried any treatments or medications?"
+        ]
+    
+    return questions[:3]  # Limit to 3 questions
+
+def create_triage_response(description, symptoms, is_emergency, thread_id=None):
+    """Create a comprehensive triage response"""
+    if not thread_id:
+        thread_id = str(uuid.uuid4())
+    
+    # Store conversation context
+    if thread_id not in conversation_threads:
+        conversation_threads[thread_id] = []
+    conversation_threads[thread_id].append({
+        "user": description,
+        "symptoms": symptoms,
+        "timestamp": datetime.now().isoformat()
+    })
+    
+    # Generate AI response if available
+    ai_response = generate_openai_response(description, symptoms)
+    
+    if is_emergency:
+        response_text = ai_response or "🚨 URGENT: Your symptoms suggest a medical emergency. Please call 112 immediately for emergency medical assistance."
+        triage_type = "hospital"
+        send_sos = True
+        possible_conditions = [
+            {
+                "name": "Emergency Medical Condition",
+                "description": "Your symptoms require immediate medical attention and emergency care.",
+                "file_citation": "emergency_protocols.json"
+            }
+        ]
+        safety_measures = [
+            "Call 112 immediately",
+            "Stay calm and don't panic",
+            "Have someone stay with you if possible",
+            "Prepare to provide your location to emergency services"
+        ]
+        follow_up_questions = []
+    else:
+        # Generate appropriate response based on symptoms
+        symptom_text = ", ".join(symptoms) if symptoms else "your symptoms"
+        
+        if ai_response:
+            response_text = ai_response
+        else:
+            response_text = (
+                f"I understand you're experiencing {symptom_text}. While I can provide general guidance, "
+                f"it's important to consult with a healthcare professional for proper evaluation and treatment. "
+                f"Monitor your symptoms and seek medical attention if they worsen or if you're concerned."
+            )
+        
+        # Determine triage level
+        if len(symptoms) >= 3 or any(s in ['chest pain', 'shortness of breath', 'severe headache'] for s in symptoms):
+            triage_type = "clinic"
+            possible_conditions = [
+                {
+                    "name": "Multiple Symptom Condition",
+                    "description": f"Your combination of symptoms ({symptom_text}) suggests a condition that should be evaluated by a healthcare provider.",
+                    "file_citation": "medical_knowledge_base.json"
+                }
+            ]
+        else:
+            triage_type = "pharmacy" if symptoms else "self-care"
+            possible_conditions = []
+        
+        send_sos = False
+        safety_measures = [
             "Monitor your symptoms closely",
             "Stay hydrated and get adequate rest",
-            "Seek medical attention if symptoms worsen"
-        ],
-        "triage": {"type": "clinic" if symptoms else "pharmacy", "location": "Unknown"},
-        "send_sos": False,
-        "follow_up_questions": [
-            "How long have you been experiencing these symptoms?",
-            "Have you tried any treatments?"
-        ],
+            "Seek medical attention if symptoms worsen",
+            "Keep a record of when symptoms occur"
+        ]
+        
+        # Add symptom-specific safety measures
+        if 'fever' in symptoms:
+            safety_measures.append("Take your temperature regularly and stay cool")
+        if 'stomach pain' in symptoms:
+            safety_measures.append("Eat bland foods and avoid spicy or fatty foods")
+        
+        follow_up_questions = generate_follow_up_questions(symptoms)
+    
+    return {
+        "text": response_text,
+        "possible_conditions": possible_conditions,
+        "safety_measures": safety_measures,
+        "triage": {"type": triage_type, "location": "Unknown"},
+        "send_sos": send_sos,
+        "follow_up_questions": follow_up_questions,
+        "thread_id": thread_id,
         "symptoms_count": len(symptoms),
-        "should_query_pinecone": len(symptoms) >= 2
+        "should_query_pinecone": len(symptoms) >= 3
     }
 
 @app.route('/')
 def home():
     return jsonify({
-        "message": "HealthMate AI Backend API - Secure Version",
+        "message": "HealthMate AI Backend API - Stable Version",
         "status": "running",
-        "version": "2.0.0",
-        "security": "Environment variables secured",
+        "version": "2.1.0",
         "features": {
-            "advanced_triage": TRIAGE_AVAILABLE,
             "openai_available": OPENAI_AVAILABLE,
-            "basic_fallback": True
+            "pinecone_available": PINECONE_AVAILABLE,
+            "emergency_detection": True,
+            "symptom_analysis": True,
+            "thread_management": True
         },
         "endpoints": [
             "/api/health/analyze - POST - Basic health analysis",
             "/api/health/languages - GET - Get supported languages", 
             "/api/health/facts - GET - Get health facts",
             "/api/health - GET - Health check",
-            "/api/triage - POST - Advanced medical triage analysis",
+            "/api/triage - POST - Medical triage analysis",
             "/api/config - GET - Configuration status"
         ]
     })
@@ -205,13 +348,15 @@ def home():
 def health_check():
     return jsonify({
         'status': 'healthy',
-        'service': 'HealthMate AI Backend API - Secure',
+        'service': 'HealthMate AI Backend API',
         'environment': 'production',
         'timestamp': datetime.now().isoformat(),
         'capabilities': {
-            'advanced_triage': TRIAGE_AVAILABLE,
             'openai_api': OPENAI_AVAILABLE,
-            'basic_triage': True,
+            'pinecone_db': PINECONE_AVAILABLE,
+            'emergency_detection': True,
+            'symptom_analysis': True,
+            'thread_persistence': True,
             'environment_variables_secured': True
         }
     })
@@ -227,9 +372,10 @@ def get_config_status():
             'EMERGENCY_HOTLINE': os.getenv('EMERGENCY_HOTLINE', '112')
         },
         'service_status': {
-            'advanced_triage': TRIAGE_AVAILABLE,
             'openai_client': OPENAI_AVAILABLE,
-            'fallback_available': True
+            'pinecone_index': PINECONE_AVAILABLE,
+            'basic_triage': True,
+            'emergency_detection': True
         }
     })
 
@@ -255,8 +401,8 @@ def analyze_health_query():
         if not user_message or not user_message.strip():
             return jsonify({'success': False, 'error': 'Message cannot be empty'}), 400
         
-        # Extract symptoms and detect emergency
-        symptoms = extract_basic_symptoms(user_message)
+        # Extract symptoms
+        symptoms = extract_symptoms(user_message)
         
         # Generate response
         if symptoms:
@@ -279,7 +425,7 @@ def analyze_health_query():
             "health_analysis": {
                 "symptoms": symptoms,
                 "body_parts": [],
-                "time_expressions": [],
+                "time_expressions": [extract_duration(user_message)] if extract_duration(user_message) else [],
                 "medications": []
             },
             "response": response
@@ -296,7 +442,7 @@ def analyze_health_query():
 @app.route('/api/triage', methods=['POST'])
 def triage_endpoint():
     """
-    Advanced triage analysis endpoint - Uses secure testtriage if available
+    Medical triage analysis endpoint with intelligent symptom assessment
     """
     try:
         if not request.is_json:
@@ -311,82 +457,24 @@ def triage_endpoint():
         
         logger.info(f"Processing triage request: {description[:50]}...")
         
-        # Try advanced triage first
-        if TRIAGE_AVAILABLE:
-            try:
-                # Create triage request
-                triage_req = TriageRequest(
-                    description=description,
-                    thread_id=thread_id
-                )
-                
-                # Run the async secure triage function
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-                try:
-                    result = loop.run_until_complete(secure_triage(triage_req))
-                finally:
-                    loop.close()
-                
-                # Convert response to dict
-                if hasattr(result, '__dict__'):
-                    response_dict = result.__dict__
-                else:
-                    response_dict = {
-                        'text': result.get('text', ''),
-                        'possible_conditions': result.get('possible_conditions', []),
-                        'safety_measures': result.get('safety_measures', []),
-                        'triage': result.get('triage', {}),
-                        'send_sos': result.get('send_sos', False),
-                        'follow_up_questions': result.get('follow_up_questions', []),
-                        'thread_id': result.get('thread_id', ''),
-                        'symptoms_count': result.get('symptoms_count', 0),
-                        'should_query_pinecone': result.get('should_query_pinecone', False)
-                    }
-                
-                logger.info(f"Advanced triage completed successfully")
-                return jsonify({
-                    'success': True,
-                    **response_dict
-                })
-                
-            except Exception as e:
-                logger.error(f"Advanced triage failed: {e}")
-                logger.info("Falling back to basic triage")
+        # Extract symptoms and assess emergency
+        symptoms = extract_symptoms(description)
+        is_emergency = detect_emergency(description)
+        severity = assess_severity(description)
+        duration = extract_duration(description)
         
-        # Fallback to basic triage
-        symptoms = extract_basic_symptoms(description)
-        is_emergency = detect_emergency_basic(description)
+        # Upgrade to emergency if high severity with concerning symptoms
+        if severity >= 8 and any(s in ['chest pain', 'shortness of breath', 'headache'] for s in symptoms):
+            is_emergency = True
+            logger.info(f"🚨 Upgraded to emergency due to severity {severity} with concerning symptoms")
         
-        # Try OpenAI enhancement if available
-        ai_response = None
-        if OPENAI_AVAILABLE:
-            try:
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-                try:
-                    ai_response = loop.run_until_complete(basic_openai_analysis(description))
-                finally:
-                    loop.close()
-            except Exception as e:
-                logger.error(f"OpenAI enhancement failed: {e}")
+        # Create comprehensive response
+        response = create_triage_response(description, symptoms, is_emergency, thread_id)
         
-        # Create basic response
-        basic_resp = create_basic_response(description, symptoms, is_emergency)
-        
-        # Enhance with AI response if available
-        if ai_response:
-            basic_resp['text'] = ai_response
-        
-        # Generate thread ID if not provided
-        if not thread_id:
-            thread_id = str(uuid.uuid4())
-        basic_resp['thread_id'] = thread_id
-        
-        logger.info(f"Basic triage completed. Emergency: {is_emergency}, Symptoms: {len(symptoms)}")
+        logger.info(f"Triage completed. Emergency: {is_emergency}, Symptoms: {len(symptoms)}, Severity: {severity}")
         return jsonify({
             'success': True,
-            **basic_resp
+            **response
         })
         
     except Exception as e:
