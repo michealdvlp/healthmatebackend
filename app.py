@@ -1,71 +1,4 @@
-def generate_non_medical_response(thread_id: str) -> Dict:
-    """Generate non-medical greeting response"""
-    response = {
-        "text": (
-            "Hi! I'm a medical triage assistant. I can help you assess symptoms and suggest possible health conditions. "
-            "For example, you can say, 'I have a cough and fever,' and I'll guide you on what to do next.\n\nPlease let me know:\n"
-            "- Are you experiencing any symptoms?"
-        ),
-        "possible_conditions": [],
-        "safety_measures": [],
-        "triage": {"type": "", "location": "Unknown"},
-        "send_sos": False,
-        "follow_up_questions": ["Are you experiencing any symptoms?"],
-        "symptoms_count": 0,
-        "should_query_pinecone": False
-    }
-    try:
-        openai_client = get_openai_client()
-        openai_client.beta.threads.messages.create(
-            thread_id=thread_id,
-            role="assistant",
-            )
-    except Exception as e:
-        logger.error(f"Error adding non-medical response to thread {thread_id}: {e}")
-    return response
-
-def generate_phase1_response(description: str, context: Dict, thread_id: str) -> Dict:
-    """Phase 1: Collect more symptoms"""
-    try:
-        symptoms = context["all_symptoms"]
-        symptoms_text = ", ".join(symptoms) if symptoms else "no symptoms reported yet"
-        follow_up_questions = generate_follow_up_questions(context)
-        text = f"I'm sorry you're dealing with {symptoms_text}. To help me understand better, please answer:\n" + "\n".join(
-            f"- {q}" for q in follow_up_questions
-        )
-        response = {
-            "text": text,
-            "possible_conditions": [],
-            "safety_measures": ["Stay hydrated", "Rest as needed"],
-            "triage": {"type": "clinic", "location": "Unknown"},
-            "send_sos": False,
-            "follow_up_questions": follow_up_questions,
-            "symptoms_count": len(symptoms),
-            "should_query_pinecone": False
-        }
-        try:
-            openai_client = get_openai_client()
-            openai_client.beta.threads.messages.create(
-                thread_id=thread_id,
-                role="assistant",
-                content=json.dumps(response)
-            )
-        except Exception as e:
-            logger.error(f"Error adding phase1 response to thread {thread_id}: {e}")
-        return response
-
-    except Exception as e:
-        logger.error(f"Error generating Phase 1 response: {e}")
-        return {
-            "text": "I need more information. Please describe your symptoms.",
-            "possible_conditions": [],
-            "safety_measures": ["Stay calm and rest"],
-            "triage": {"type": "clinic", "location": "Unknown"},
-            "send_sos": False,
-            "follow_up_questions": ["Do you have any symptoms?"],
-            "symptoms_count": 0,
-            "should_query_pinecone": False
-        }import os
+import os
 import json
 import logging
 import re
@@ -142,7 +75,7 @@ def get_pinecone_index():
     return _pinecone_index
 
 # ======================
-# Utility Functions (updated for OpenAI 1.1.1)
+# Utility Functions
 # ======================
 
 def validate_thread(thread_id: str) -> bool:
@@ -265,7 +198,7 @@ def extract_symptoms_comprehensive(description: str) -> Dict:
     try:
         description_lower = description.lower()
 
-        # Extract duration and severity (same regex logic)
+        # Extract duration and severity
         duration = None
         duration_patterns = [
             r"(since|started|began)\s*(yesterday|last night|today|[0-9]+\s*(day|hour|minute|week|month)s?\s*ago)",
@@ -415,6 +348,173 @@ def get_embeddings(texts: List[str], model: str = EMBEDDING_MODEL) -> Optional[L
     for attempt in range(MAX_RETRIES):
         try:
             openai_client = get_openai_client()
+            openai_client.beta.threads.messages.create(
+                thread_id=thread_id,
+                role="assistant",
+                content=json.dumps(response)
+            )
+        except Exception as e:
+            logger.error(f"Error adding contextual response to thread {thread_id}: {e}")
+
+        return response
+
+    except Exception as e:
+        logger.error(f"Error in generate_contextual_response: {e}")
+        return {
+            "text": "Thank you for your response. Please provide more details about your symptoms so I can assist you further.",
+            "possible_conditions": [],
+            "safety_measures": ["Stay calm and rest"],
+            "triage": {"type": "clinic", "location": "Unknown"},
+            "send_sos": False,
+            "follow_up_questions": ["Do you have any other symptoms?"],
+            "symptoms_count": 0,
+            "should_query_pinecone": False
+        }
+
+def should_continue_conversation(thread_id: str, description: str) -> bool:
+    """Decide if we should continue an ongoing conversation"""
+    try:
+        context = get_thread_context(thread_id)
+        if context["all_symptoms"] or context["assistant_responses"] > 0:
+            logger.info(f"Continuing conversation in thread {thread_id}")
+            return True
+
+        intent_result = detect_intent(description, thread_id)
+        intents = intent_result["intent"]
+        logger.info(f"Intent for thread: {intents}")
+        return any(i in ["medical", "contextual"] for i in intents)
+
+    except Exception as e:
+        logger.error(f"Error checking conversation continuity: {e}")
+        return False
+
+# ======================
+# Main Triage Function (EXACT same logic as testtriage.py)
+# ======================
+
+def triage_main(description: str, thread_id: Optional[str] = None) -> Dict:
+    """
+    The main triage function - exact same logic as testtriage.py
+    """
+    try:
+        description = description.strip()
+        logger.info(f"=== TRIAGE REQUEST === Description: '{description[:50]}...', Thread: {thread_id}")
+
+        # 1) Validate or create a thread
+        if not thread_id or not validate_thread(thread_id):
+            openai_client = get_openai_client()
+            new_thread = openai_client.beta.threads.create()
+            thread_id = new_thread.id
+            logger.info(f"Created new thread ID: {thread_id}")
+
+        # 2) Append user message
+        openai_client = get_openai_client()
+        openai_client.beta.threads.messages.create(
+            thread_id=thread_id,
+            role="user",
+            content=description
+        )
+
+        # 3) Recompute thread context
+        context = get_thread_context(thread_id)
+        intent_result = detect_intent(description, thread_id)
+        intents = intent_result["intent"]
+
+        symptom_count = len(context["all_symptoms"])
+        max_severity = context["max_severity"]
+        is_continuing = should_continue_conversation(thread_id, description)
+        should_query = should_query_pinecone_database(context)
+        is_emergency = is_red_flag(" ".join(context["user_messages"]), max_severity)
+
+        logger.info((
+            f"Intents: {intents}, Continuing: {is_continuing}, "
+            f"Symptoms: {context['all_symptoms']}, Count: {symptom_count}, "
+            f"Max severity: {max_severity}, Should query: {should_query}, Emergency: {is_emergency}"
+        ))
+
+        # 4) Decide which "phase" to run
+        if "non_medical" in intents and not is_continuing and not context["all_symptoms"]:
+            response = generate_non_medical_response(thread_id)
+        elif "contextual" in intents and context["all_symptoms"]:
+            response = generate_contextual_response(description, thread_id, context)
+        elif is_emergency or should_query:
+            logger.info(f"Phase 2 (emergency={is_emergency}, should_query={should_query})")
+            response = generate_phase2_response(context, is_emergency, thread_id)
+        else:
+            logger.info(f"Phase 1 (assistant_responses={context['assistant_responses']+1}/{MAX_ITERATIONS})")
+            response = generate_phase1_response(description, context, thread_id)
+
+        response["thread_id"] = thread_id
+        return response
+
+    except Exception as e:
+        logger.error(f"Error in triage function: {e}")
+        return {
+            "text": f"Internal server error: {str(e)}",
+            "possible_conditions": [],
+            "safety_measures": [],
+            "triage": {"type": "hospital", "location": "Unknown"},
+            "send_sos": True,
+            "follow_up_questions": [],
+            "thread_id": thread_id or "error",
+            "symptoms_count": 0,
+            "should_query_pinecone": False
+        }
+
+# ======================
+# Flask Routes
+# ======================
+
+@app.route('/')
+def home():
+    return jsonify({
+        "message": "HealthMate AI Backend API - testtriage.py Compatible",
+        "status": "running", 
+        "version": "5.0.0",
+        "endpoints": [
+            "/triage - POST - Advanced medical triage analysis (same as testtriage.py)",
+            "/health - GET - Health check"
+        ],
+        "openai_version": "1.1.1",
+        "pinecone_version": "2.2.4"
+    })
+
+@app.route('/health')
+def health_check():
+    """Simple health check endpoint"""
+    return {"status": "healthy", "timestamp": str(datetime.now())}
+
+@app.route('/triage', methods=['POST'])
+def triage_endpoint():
+    """
+    The main /triage endpoint - EXACT same as testtriage.py but as Flask route
+    """
+    try:
+        if not request.is_json:
+            return jsonify({'error': 'Request must be JSON'}), 400
+        
+        data = request.json
+        if not data or 'description' not in data:
+            return jsonify({'error': 'No description provided'}), 400
+        
+        description = data['description']
+        thread_id = data.get('thread_id')
+        
+        # Call the main triage function (same logic as testtriage.py)
+        result = triage_main(description, thread_id)
+        
+        return jsonify(result)
+        
+    except Exception as e:
+        logger.error(f"Error in /triage endpoint: {e}")
+        return jsonify({
+            "error": f"Internal server error: {str(e)}"
+        }), 500
+
+# For Vercel
+if __name__ == '__main__':
+    port = int(os.environ.get('PORT', 5000))
+    app.run(host='0.0.0.0', port=port, debug=False)client = get_openai_client()
             response = openai_client.embeddings.create(input=texts, model=model)
             return [item.embedding for item in response.data]
         except Exception as e:
@@ -424,7 +524,7 @@ def get_embeddings(texts: List[str], model: str = EMBEDDING_MODEL) -> Optional[L
     return None
 
 def query_index(query_text: str, symptoms: List[str], context: Dict, top_k: int = 50) -> List[Dict]:
-    """Run a Pinecone vector query using older API"""
+    """Run a Pinecone vector query"""
     query_embedding = get_embeddings([query_text])
     if not query_embedding:
         logger.error("Failed to generate query embedding.")
@@ -549,8 +649,8 @@ def generate_non_medical_response(thread_id: str) -> Dict:
         "should_query_pinecone": False
     }
     try:
-        openai = get_openai_client()
-        openai.beta.threads.messages.create(
+        openai_client = get_openai_client()
+        openai_client.beta.threads.messages.create(
             thread_id=thread_id,
             role="assistant",
             content=json.dumps(response)
@@ -579,8 +679,8 @@ def generate_phase1_response(description: str, context: Dict, thread_id: str) ->
             "should_query_pinecone": False
         }
         try:
-            openai = get_openai_client()
-            openai.beta.threads.messages.create(
+            openai_client = get_openai_client()
+            openai_client.beta.threads.messages.create(
                 thread_id=thread_id,
                 role="assistant",
                 content=json.dumps(response)
@@ -764,171 +864,4 @@ def generate_contextual_response(description: str, thread_id: str, context: Dict
         }
 
         try:
-            openai_client = get_openai_client()
-            openai_client.beta.threads.messages.create(
-                thread_id=thread_id,
-                role="assistant",
-                content=json.dumps(response)
-            )
-        except Exception as e:
-            logger.error(f"Error adding contextual response to thread {thread_id}: {e}")
-
-        return response
-
-    except Exception as e:
-        logger.error(f"Error in generate_contextual_response: {e}")
-        return {
-            "text": "Thank you for your response. Please provide more details about your symptoms so I can assist you further.",
-            "possible_conditions": [],
-            "safety_measures": ["Stay calm and rest"],
-            "triage": {"type": "clinic", "location": "Unknown"},
-            "send_sos": False,
-            "follow_up_questions": ["Do you have any other symptoms?"],
-            "symptoms_count": 0,
-            "should_query_pinecone": False
-        }
-
-def should_continue_conversation(thread_id: str, description: str) -> bool:
-    """Decide if we should continue an ongoing conversation"""
-    try:
-        context = get_thread_context(thread_id)
-        if context["all_symptoms"] or context["assistant_responses"] > 0:
-            logger.info(f"Continuing conversation in thread {thread_id}")
-            return True
-
-        intent_result = detect_intent(description, thread_id)
-        intents = intent_result["intent"]
-        logger.info(f"Intent for thread: {intents}")
-        return any(i in ["medical", "contextual"] for i in intents)
-
-    except Exception as e:
-        logger.error(f"Error checking conversation continuity: {e}")
-        return False
-
-# ======================
-# Main Triage Function (EXACT same logic as testtriage.py)
-# ======================
-
-def triage_main(description: str, thread_id: Optional[str] = None) -> Dict:
-    """
-    The main triage function - exact same logic as testtriage.py
-    """
-    try:
-        description = description.strip()
-        logger.info(f"=== TRIAGE REQUEST === Description: '{description[:50]}...', Thread: {thread_id}")
-
-        # 1) Validate or create a thread
-        if not thread_id or not validate_thread(thread_id):
-            openai_client = get_openai_client()
-            new_thread = openai_client.beta.threads.create()
-            thread_id = new_thread.id
-            logger.info(f"Created new thread ID: {thread_id}")
-
-        # 2) Append user message
-        openai_client = get_openai_client()
-        openai_client.beta.threads.messages.create(
-            thread_id=thread_id,
-            role="user",
-            content=description
-        )
-
-        # 3) Recompute thread context
-        context = get_thread_context(thread_id)
-        intent_result = detect_intent(description, thread_id)
-        intents = intent_result["intent"]
-
-        symptom_count = len(context["all_symptoms"])
-        max_severity = context["max_severity"]
-        is_continuing = should_continue_conversation(thread_id, description)
-        should_query = should_query_pinecone_database(context)
-        is_emergency = is_red_flag(" ".join(context["user_messages"]), max_severity)
-
-        logger.info((
-            f"Intents: {intents}, Continuing: {is_continuing}, "
-            f"Symptoms: {context['all_symptoms']}, Count: {symptom_count}, "
-            f"Max severity: {max_severity}, Should query: {should_query}, Emergency: {is_emergency}"
-        ))
-
-        # 4) Decide which "phase" to run
-        if "non_medical" in intents and not is_continuing and not context["all_symptoms"]:
-            response = generate_non_medical_response(thread_id)
-        elif "contextual" in intents and context["all_symptoms"]:
-            response = generate_contextual_response(description, thread_id, context)
-        elif is_emergency or should_query:
-            logger.info(f"Phase 2 (emergency={is_emergency}, should_query={should_query})")
-            response = generate_phase2_response(context, is_emergency, thread_id)
-        else:
-            logger.info(f"Phase 1 (assistant_responses={context['assistant_responses']+1}/{MAX_ITERATIONS})")
-            response = generate_phase1_response(description, context, thread_id)
-
-        response["thread_id"] = thread_id
-        return response
-
-    except Exception as e:
-        logger.error(f"Error in triage function: {e}")
-        return {
-            "text": f"Internal server error: {str(e)}",
-            "possible_conditions": [],
-            "safety_measures": [],
-            "triage": {"type": "hospital", "location": "Unknown"},
-            "send_sos": True,
-            "follow_up_questions": [],
-            "thread_id": thread_id or "error",
-            "symptoms_count": 0,
-            "should_query_pinecone": False
-        }
-
-# ======================
-# Flask Routes
-# ======================
-
-@app.route('/')
-def home():
-    return jsonify({
-        "message": "HealthMate AI Backend API - testtriage.py Compatible",
-        "status": "running", 
-        "version": "5.0.0",
-        "endpoints": [
-            "/triage - POST - Advanced medical triage analysis (same as testtriage.py)",
-            "/health - GET - Health check"
-        ],
-        "openai_version": "1.1.1",
-        "pinecone_version": "2.2.4"
-    })
-
-@app.route('/health')
-def health_check():
-    """Simple health check endpoint"""
-    return {"status": "healthy", "timestamp": str(datetime.now())}
-
-@app.route('/triage', methods=['POST'])
-def triage_endpoint():
-    """
-    The main /triage endpoint - EXACT same as testtriage.py but as Flask route
-    """
-    try:
-        if not request.is_json:
-            return jsonify({'error': 'Request must be JSON'}), 400
-        
-        data = request.json
-        if not data or 'description' not in data:
-            return jsonify({'error': 'No description provided'}), 400
-        
-        description = data['description']
-        thread_id = data.get('thread_id')
-        
-        # Call the main triage function (same logic as testtriage.py)
-        result = triage_main(description, thread_id)
-        
-        return jsonify(result)
-        
-    except Exception as e:
-        logger.error(f"Error in /triage endpoint: {e}")
-        return jsonify({
-            "error": f"Internal server error: {str(e)}"
-        }), 500
-
-# For Vercel
-if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 5000))
-    app.run(host='0.0.0.0', port=port, debug=False)
+            openai_
