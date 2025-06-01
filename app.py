@@ -7,8 +7,6 @@ from typing import List, Dict, Optional
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from dotenv import load_dotenv
-import openai
-import pinecone
 
 # -----------------------------------
 # Setup logging
@@ -55,9 +53,10 @@ _openai_client = None
 _pinecone_index = None
 
 def get_openai_client():
-    """Lazy-load OpenAI client using compatible version"""
+    """Lazy-load OpenAI client"""
     global _openai_client
     if _openai_client is None:
+        import openai
         _openai_client = openai.OpenAI(api_key=OPENAI_API_KEY)
     return _openai_client
 
@@ -66,6 +65,7 @@ def get_pinecone_index():
     global _pinecone_index
     if _pinecone_index is None:
         try:
+            import pinecone
             pinecone.init(api_key=PINECONE_API_KEY, environment=PINECONE_ENV)
             _pinecone_index = pinecone.Index(INDEX_NAME)
             logger.info(f"Initialized Pinecone index '{INDEX_NAME}'")
@@ -341,7 +341,7 @@ def should_query_pinecone_database(context: Dict) -> bool:
     return False
 
 def get_embeddings(texts: List[str], model: str = EMBEDDING_MODEL) -> Optional[List[List[float]]]:
-    """Get embeddings using OpenAI 1.1.1"""
+    """Get embeddings using OpenAI"""
     for attempt in range(MAX_RETRIES):
         try:
             openai_client = get_openai_client()
@@ -354,7 +354,7 @@ def get_embeddings(texts: List[str], model: str = EMBEDDING_MODEL) -> Optional[L
     return None
 
 def query_index(query_text: str, symptoms: List[str], context: Dict, top_k: int = 50) -> List[Dict]:
-    """Run a Pinecone vector query using older API"""
+    """Run a Pinecone vector query"""
     query_embedding = get_embeddings([query_text])
     if not query_embedding:
         logger.error("Failed to generate query embedding.")
@@ -388,7 +388,7 @@ def query_index(query_text: str, symptoms: List[str], context: Dict, top_k: int 
         return []
 
 def generate_detailed_condition_description(condition_name: str, user_symptoms: List[str]) -> str:
-    """Generate condition description using OpenAI 1.1.1"""
+    """Generate condition description using OpenAI"""
     try:
         symptoms_text = ", ".join(user_symptoms)
         for attempt in range(MAX_RETRIES):
@@ -739,18 +739,20 @@ def should_continue_conversation(thread_id: str, description: str) -> bool:
 
 def triage_main(description: str, thread_id: Optional[str] = None) -> Dict:
     """
-    The main triage function
+    The main triage function - exact same logic as testtriage.py
     """
     try:
         description = description.strip()
         logger.info(f"=== TRIAGE REQUEST === Description: '{description[:50]}...', Thread: {thread_id}")
 
+        # 1) Validate or create a thread
         if not thread_id or not validate_thread(thread_id):
             openai_client = get_openai_client()
             new_thread = openai_client.beta.threads.create()
             thread_id = new_thread.id
             logger.info(f"Created new thread ID: {thread_id}")
 
+        # 2) Append user message
         openai_client = get_openai_client()
         openai_client.beta.threads.messages.create(
             thread_id=thread_id,
@@ -758,6 +760,7 @@ def triage_main(description: str, thread_id: Optional[str] = None) -> Dict:
             content=description
         )
 
+        # 3) Recompute thread context
         context = get_thread_context(thread_id)
         intent_result = detect_intent(description, thread_id)
         intents = intent_result["intent"]
@@ -774,6 +777,7 @@ def triage_main(description: str, thread_id: Optional[str] = None) -> Dict:
             f"Max severity: {max_severity}, Should query: {should_query}, Emergency: {is_emergency}"
         ))
 
+        # 4) Decide which "phase" to run
         if "non_medical" in intents and not is_continuing and not context["all_symptoms"]:
             response = generate_non_medical_response(thread_id)
         elif "contextual" in intents and context["all_symptoms"]:
@@ -828,7 +832,7 @@ def health_check():
 @app.route('/triage', methods=['POST'])
 def triage_endpoint():
     """
-    The main /triage endpoint
+    The main /triage endpoint - EXACT same as testtriage.py but as Flask route
     """
     try:
         if not request.is_json:
@@ -841,6 +845,7 @@ def triage_endpoint():
         description = data['description']
         thread_id = data.get('thread_id')
         
+        # Call the main triage function (same logic as testtriage.py)
         result = triage_main(description, thread_id)
         
         return jsonify(result)
