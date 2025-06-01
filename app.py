@@ -61,16 +61,10 @@ SUPPORTED_LANGUAGES = {
     "pcm": "Nigerian Pidgin"
 }
 
-# Health categories for awareness content
-HEALTH_CATEGORIES = [
-    "Nutrition", "Exercise", "Mental Health", "Sleep", "Preventive Care",
-    "Common Illnesses", "First Aid", "Chronic Conditions", "Women's Health",
-    "Men's Health", "Children's Health", "Elderly Care"
-]
-
-# Emergency red flags
+# Emergency red flags - MORE SPECIFIC
 RED_FLAGS = [
-    "chest pain", "difficulty breathing", "shortness of breath", "can't breathe",
+    "crushing chest pain", "severe chest pain", "heart attack",
+    "difficulty breathing", "can't breathe", "unable to breathe",
     "severe bleeding", "profuse bleeding", "uncontrolled bleeding",
     "loss of consciousness", "unconscious", "passed out",
     "severe headache", "worst headache ever", "sudden severe headache",
@@ -80,16 +74,12 @@ RED_FLAGS = [
     "compound fracture", "bone sticking out",
     "severe burns", "third degree burns",
     "poisoning", "overdose",
-    "severe abdominal pain", "appendicitis symptoms",
-    "heart attack", "crushing chest pain"
+    "severe abdominal pain", "appendicitis symptoms"
 ]
 
-# In-memory storage for conversations and cache
+# In-memory storage
 conversation_threads = {}
-_content_cache = {}
-_cache_expiry = {}
 _pinecone_index = None
-CACHE_DURATION = 24 * 60 * 60  # 24 hours
 
 # ======================
 # Core Classes
@@ -112,7 +102,7 @@ class ConversationThread:
         })
         self.conversation_count += 1
         
-        # Add new symptoms to accumulated list
+        # Add new symptoms to accumulated list (deduplicated)
         for symptom in extracted_symptoms:
             if symptom.lower() not in [s.lower() for s in self.all_symptoms]:
                 self.all_symptoms.append(symptom.lower())
@@ -152,7 +142,7 @@ def get_pinecone_index():
 # OpenAI Functions
 # ======================
 
-def call_openai_chat(messages: List[Dict], model: str = "gpt-4", temperature: float = 0.3, max_tokens: int = 200) -> Optional[str]:
+def call_openai_chat(messages: List[Dict], model: str = "gpt-4", temperature: float = 0.3, max_tokens: int = 500) -> Optional[str]:
     """Call OpenAI Chat API"""
     if not OPENAI_AVAILABLE:
         return None
@@ -184,92 +174,7 @@ def call_openai_embeddings(texts: List[str], model: str = EMBEDDING_MODEL) -> Op
         return None
 
 # ======================
-# Translation Functions
-# ======================
-
-def detect_language(text):
-    """Detect language using Azure Translator"""
-    if not TRANSLATOR_AVAILABLE:
-        logger.warning("Azure Translator not available, defaulting to English")
-        return "en"
-    
-    url = f"{AZURE_TRANSLATOR_ENDPOINT}/detect"
-    params = {'api-version': '3.0'}
-    headers = {
-        'Ocp-Apim-Subscription-Key': AZURE_TRANSLATOR_KEY,
-        'Ocp-Apim-Subscription-Region': AZURE_TRANSLATOR_REGION,
-        'Content-type': 'application/json',
-        'X-ClientTraceId': str(uuid.uuid4())
-    }
-    body = [{'text': text}]
-    
-    try:
-        response = requests.post(url, params=params, headers=headers, json=body)
-        response.raise_for_status()
-        detected_language = response.json()[0]["language"]
-        return detected_language
-    except Exception as e:
-        logger.error(f"Error detecting language: {e}")
-        return "en"
-
-def translate_to_english(text, source_language):
-    """Translate text to English"""
-    if not TRANSLATOR_AVAILABLE or source_language == "en":
-        return text
-    
-    url = f"{AZURE_TRANSLATOR_ENDPOINT}/translate"
-    params = {
-        'api-version': '3.0',
-        'from': source_language,
-        'to': ['en']
-    }
-    headers = {
-        'Ocp-Apim-Subscription-Key': AZURE_TRANSLATOR_KEY,
-        'Ocp-Apim-Subscription-Region': AZURE_TRANSLATOR_REGION,
-        'Content-type': 'application/json',
-        'X-ClientTraceId': str(uuid.uuid4())
-    }
-    body = [{'text': text}]
-    
-    try:
-        response = requests.post(url, params=params, headers=headers, json=body)
-        response.raise_for_status()
-        translated_text = response.json()[0]["translations"][0]["text"]
-        return translated_text
-    except Exception as e:
-        logger.error(f"Error translating text: {e}")
-        return text
-
-def translate_to_language(text, target_language):
-    """Translate text to target language"""
-    if not TRANSLATOR_AVAILABLE or target_language == "en":
-        return text
-        
-    url = f"{AZURE_TRANSLATOR_ENDPOINT}/translate"
-    params = {
-        'api-version': '3.0',
-        'from': 'en',
-        'to': [target_language]
-    }
-    headers = {
-        'Ocp-Apim-Subscription-Key': AZURE_TRANSLATOR_KEY,
-        'Ocp-Apim-Subscription-Region': AZURE_TRANSLATOR_REGION,
-        'Content-type': 'application/json',
-        'X-ClientTraceId': str(uuid.uuid4())
-    }
-    body = [{'text': text}]
-    
-    try:
-        response = requests.post(url, params=params, headers=headers, json=body)
-        response.raise_for_status()
-        translated_text = response.json()[0]["translations"][0]["text"]
-        return translated_text
-    except Exception as e:
-        logger.error(f"Error translating back to {target_language}: {e}")
-        return text
-
-# ======================
-# Symptom Extraction
+# Dynamic Symptom Extraction
 # ======================
 
 async def extract_symptoms_comprehensive(text):
@@ -439,37 +344,40 @@ def extract_symptoms_fallback(text):
     }
 
 # ======================
-# Emergency Detection
+# Emergency Detection - FIXED
 # ======================
 
 def detect_emergency(text, symptoms_list=None):
-    """Detect emergency situations"""
+    """Detect emergency situations - IMPROVED LOGIC"""
     text_lower = text.lower()
     
-    # Check for red flag keywords
+    # Check for specific red flag phrases (more specific now)
     for flag in RED_FLAGS:
         if flag in text_lower:
             logger.info(f"Emergency detected: {flag}")
             return True
     
-    # Check for emergency symptom combinations
-    if symptoms_list:
+    # Check for emergency symptom combinations ONLY
+    if symptoms_list and len(symptoms_list) >= 3:
         symptoms_lower = [s.lower() for s in symptoms_list]
         
-        # Cardiac emergency pattern
-        cardiac_symptoms = {"chest pain", "shortness of breath", "sweating", "nausea"}
-        if len(set(symptoms_lower) & cardiac_symptoms) >= 3:
-            logger.info("Emergency: Possible cardiac event detected")
+        # Cardiac emergency pattern - need 3+ cardiac symptoms
+        cardiac_symptoms = {"chest pain", "shortness of breath", "sweating", "nausea", "dizziness"}
+        cardiac_matches = set(symptoms_lower) & cardiac_symptoms
+        if len(cardiac_matches) >= 3:
+            logger.info(f"Emergency: Cardiac pattern detected with symptoms: {cardiac_matches}")
             return True
             
-        # Severe infection pattern
-        infection_symptoms = {"fever", "severe pain", "difficulty breathing"}
-        if len(set(symptoms_lower) & infection_symptoms) >= 2:
-            severity_indicators = ["severe", "extreme", "unbearable", "can't"]
+        # Severe infection pattern - need high severity + multiple symptoms
+        infection_symptoms = {"fever", "severe pain", "difficulty breathing", "vomiting"}
+        infection_matches = set(symptoms_lower) & infection_symptoms
+        if len(infection_matches) >= 2:
+            severity_indicators = ["severe", "extreme", "unbearable", "can't", "intense"]
             if any(indicator in text_lower for indicator in severity_indicators):
-                logger.info("Emergency: Severe infection pattern detected")
+                logger.info(f"Emergency: Severe infection pattern detected")
                 return True
     
+    logger.info("No emergency pattern detected")
     return False
 
 def detect_intent(text, thread_context=None):
@@ -505,16 +413,19 @@ def detect_intent(text, thread_context=None):
     return 'medical' if has_symptoms else 'contextual'
 
 # ======================
-# Pinecone Functions
+# Pinecone Functions - FIXED
 # ======================
 
-def should_query_pinecone_database(accumulated_symptoms: List[str], severity: int, full_text: str) -> bool:
-    """Decide whether to query Pinecone"""
+def should_query_pinecone_database(accumulated_symptoms: List[str], conversation_count: int, full_text: str) -> bool:
+    """Decide whether to query Pinecone - IMPROVED LOGIC"""
     symptom_count = len(accumulated_symptoms)
-    if symptom_count >= MIN_SYMPTOMS_FOR_PINECONE:
-        logger.info(f"Sufficient accumulated symptoms ({symptom_count}) → query Pinecone.")
+    
+    # Need minimum symptoms AND conversation history
+    if symptom_count >= MIN_SYMPTOMS_FOR_PINECONE and conversation_count >= 1:
+        logger.info(f"Sufficient accumulated symptoms ({symptom_count}) and conversation history ({conversation_count}) → query Pinecone.")
         return True
 
+    # Explicit condition request
     condition_keywords = [
         "what might be", "what could be", "what is", "infection", "condition",
         "disease", "diagnosis", "what's wrong", "what do i have"
@@ -523,10 +434,10 @@ def should_query_pinecone_database(accumulated_symptoms: List[str], severity: in
         logger.info("User explicitly asked for condition identification → query Pinecone.")
         return True
 
-    logger.info(f"Not querying Pinecone: only {symptom_count} accumulated symptoms, no explicit ask.")
+    logger.info(f"Not querying Pinecone: {symptom_count} symptoms, {conversation_count} conversations")
     return False
 
-def query_pinecone_index(query_text: str, accumulated_symptoms: List[str], top_k: int = 50) -> List[Dict]:
+def query_pinecone_index(query_text: str, accumulated_symptoms: List[str], top_k: int = 30) -> List[Dict]:
     """Query Pinecone for similar conditions"""
     if not PINECONE_AVAILABLE:
         logger.warning("Pinecone not available")
@@ -542,8 +453,10 @@ def query_pinecone_index(query_text: str, accumulated_symptoms: List[str], top_k
         # Query Pinecone
         index = get_pinecone_index()
         if not index:
+            logger.error("Pinecone index not available")
             return []
             
+        logger.info(f"Querying Pinecone with: {query_text}")
         response = index.query(
             vector=query_embedding[0],
             top_k=top_k,
@@ -626,7 +539,7 @@ def rank_conditions(matches: List[Dict], accumulated_symptoms: List[str]) -> Lis
         condition_data.sort(key=lambda x: x["score"], reverse=True)
 
         final = []
-        for cond in condition_data[:5]:
+        for cond in condition_data[:3]:  # Top 3 conditions
             final.append({
                 "name": cond["name"],
                 "description": cond["description"],
@@ -639,153 +552,10 @@ def rank_conditions(matches: List[Dict], accumulated_symptoms: List[str]) -> Lis
         return []
 
 # ======================
-# Health Awareness Functions
+# Response Generation - IMPROVED
 # ======================
 
-def get_color_for_category(category):
-    """Return a consistent color for each category"""
-    colors = {
-        "Nutrition": "#4CAF50",
-        "Exercise": "#2196F3",
-        "Mental Health": "#9C27B0",
-        "Sleep": "#673AB7",
-        "Preventive Care": "#00BCD4",
-        "Common Illnesses": "#FF5722",
-        "First Aid": "#F44336",
-        "Chronic Conditions": "#795548",
-        "Women's Health": "#E91E63",
-        "Men's Health": "#3F51B5",
-        "Children's Health": "#FFEB3B",
-        "Elderly Care": "#607D8B"
-    }
-    return colors.get(category, "#FF9800")
-
-def generate_awareness_content(category, count=3):
-    """Generate health awareness content using OpenAI"""
-    cache_key = f"{category}_{count}"
-    
-    # Check cache first
-    if cache_key in _content_cache and datetime.now() < _cache_expiry.get(cache_key, datetime.now()):
-        logger.info(f"Returning cached content for {category}")
-        return _content_cache[cache_key]
-    
-    if not OPENAI_AVAILABLE:
-        return get_fallback_content(category, count)
-    
-    try:
-        prompt = f"""
-        Generate {count} informative and evidence-based health awareness articles about {category}.
-        For each article, provide:
-        1. An attention-grabbing title (5-8 words)
-        2. Informative content (100-150 words) with practical advice
-        3. Make the content culturally sensitive and appropriate for diverse populations
-        4. Ensure medical accuracy and avoid overly technical language
-        
-        Return as JSON array: [{"title": "...", "content": "..."}, ...]
-        """
-        
-        client = openai.OpenAI(api_key=OPENAI_API_KEY)
-        response = client.chat.completions.create(
-            model="gpt-4",
-            messages=[
-                {"role": "system", "content": "You are a health educator providing accurate, helpful health information. Return only valid JSON."},
-                {"role": "user", "content": prompt}
-            ],
-            temperature=0.3,
-            max_tokens=1500
-        )
-        
-        # Parse the response
-        response_content = json.loads(response.choices[0].message.content)
-        
-        # Ensure we have the expected structure
-        if isinstance(response_content, list):
-            articles = response_content
-        elif "articles" in response_content:
-            articles = response_content["articles"]
-        else:
-            # Try to find any list in the response
-            for key, value in response_content.items():
-                if isinstance(value, list) and len(value) > 0:
-                    articles = value
-                    break
-            else:
-                raise ValueError("Unexpected response structure from OpenAI")
-        
-        # Format the articles with category and color
-        formatted_articles = []
-        for article in articles:
-            formatted_articles.append({
-                "title": article.get("title", "Health Tips"),
-                "content": article.get("content", "Information not available"),
-                "category": category,
-                "color": get_color_for_category(category)
-            })
-        
-        # Cache the results
-        _content_cache[cache_key] = formatted_articles
-        _cache_expiry[cache_key] = datetime.now() + timedelta(seconds=CACHE_DURATION)
-        
-        return formatted_articles
-        
-    except Exception as e:
-        logger.error(f"Error generating awareness content for {category}: {str(e)}")
-        return get_fallback_content(category, count)
-
-def get_fallback_content(category, count=3):
-    """Get fallback content when OpenAI is not available"""
-    fallback_content = {
-        "Nutrition": [
-            {
-                "title": "The Importance of Balanced Diet",
-                "content": "A balanced diet provides essential nutrients needed for good health. Include fruits, vegetables, whole grains, lean proteins, and healthy fats in your daily meals. Aim for variety and moderation to ensure you get all necessary vitamins and minerals.",
-                "category": "Nutrition",
-                "color": "#4CAF50"
-            }
-        ],
-        "Exercise": [
-            {
-                "title": "Benefits of Regular Physical Activity",
-                "content": "Regular exercise improves cardiovascular health, strengthens muscles, and enhances mood. Aim for at least 150 minutes of moderate activity weekly. Even short walks provide benefits.",
-                "category": "Exercise",
-                "color": "#2196F3"
-            }
-        ]
-    }
-    
-    default_content = [{
-        "title": f"Important {category} Tips",
-        "content": f"Taking care of your {category.lower()} is essential for overall wellbeing. Regular attention to this aspect of health can prevent problems and improve quality of life.",
-        "category": category,
-        "color": get_color_for_category(category)
-    }]
-    
-    content = fallback_content.get(category, default_content)
-    return content[:count]
-
-def get_random_awareness_content(count=5):
-    """Get random awareness content across categories"""
-    import random
-    
-    result = []
-    categories = random.sample(HEALTH_CATEGORIES, min(count, len(HEALTH_CATEGORIES)))
-    
-    for category in categories:
-        try:
-            content = generate_awareness_content(category, count=1)
-            if content:
-                result.extend(content)
-        except Exception as e:
-            logger.error(f"Error getting random content for {category}: {str(e)}")
-            result.extend(get_fallback_content(category, 1))
-    
-    return result
-
-# ======================
-# Response Generation Functions
-# ======================
-
-async def generate_openai_response(description, thread_context, intent):
+async def generate_openai_response(description, thread_context, intent, accumulated_symptoms):
     """Generate response using OpenAI with proper context"""
     if not OPENAI_AVAILABLE:
         return None
@@ -805,7 +575,7 @@ async def generate_openai_response(description, thread_context, intent):
             system_prompt = """You are a medical triage assistant for Nigeria. Introduce yourself and explain how you can help with health concerns. Be warm and professional."""
             user_prompt = description
         
-        elif thread_context and len(thread_context.all_symptoms) < 3 and thread_context.conversation_count < 3:
+        elif len(accumulated_symptoms) < 3 and thread_context.conversation_count < 3:
             # Phase 1: Gathering symptoms
             system_prompt = """You are a medical triage assistant. The user is describing symptoms. Your job is to:
 1. Acknowledge their symptoms with empathy
@@ -827,7 +597,7 @@ Respond in JSON format:
             # Phase 2: Analysis and recommendations
             system_prompt = """You are a medical triage assistant. The user has provided sufficient symptom information. Provide:
 1. Comprehensive analysis of their symptoms
-2. 2-3 possible conditions with explanations
+2. 2-3 possible conditions with explanations (if you have enough information)
 3. Specific safety measures and self-care
 4. Clear next steps for medical care
 5. Emergency guidance if needed
@@ -841,7 +611,7 @@ Respond in JSON format:
     "follow_up_questions": ["question 1", "question 2"],
     "send_sos": true/false
 }"""
-            user_prompt = f"{context_str}Current message: {description}"
+            user_prompt = f"{context_str}Current message: {description}\nAccumulated symptoms: {', '.join(accumulated_symptoms)}"
         
         # Call OpenAI
         client = openai.OpenAI(api_key=OPENAI_API_KEY)
@@ -852,7 +622,7 @@ Respond in JSON format:
                 {"role": "user", "content": user_prompt}
             ],
             temperature=0.3,
-            max_tokens=1000
+            max_tokens=800
         )
         
         # Parse response
@@ -888,13 +658,13 @@ def create_fallback_response(description, symptoms, is_emergency, intent, thread
     
     if is_emergency:
         return {
-            "response_text": "🚨 URGENT: Your symptoms suggest a medical emergency. Please call 112 immediately for emergency medical assistance.",
+            "response_text": "🚨 Your symptoms suggest this could be serious. Please call 112 immediately for emergency medical assistance or go to the nearest hospital.",
             "urgency": "urgent",
             "possible_conditions": [
-                {"name": "Emergency Condition", "description": "Your symptoms require immediate medical attention"}
+                {"name": "Serious Medical Condition", "description": "Your combination of symptoms requires immediate medical evaluation"}
             ],
             "safety_measures": [
-                "Call 112 immediately",
+                "Call 112 immediately or go to nearest hospital",
                 "Stay calm and don't panic",
                 "Have someone stay with you if possible"
             ],
@@ -907,10 +677,10 @@ def create_fallback_response(description, symptoms, is_emergency, intent, thread
     if thread_context and len(thread_context.all_symptoms) < 3:
         # Phase 1: Gathering more symptoms
         return {
-            "response_text": f"I'm sorry you're experiencing {symptom_text}. To help me understand better, please answer these questions:",
+            "response_text": f"I'm sorry you're experiencing {symptom_text}. To help me understand better and provide more accurate guidance, could you tell me more about what you're experiencing?",
             "urgency": "mild",
             "possible_conditions": [],
-            "safety_measures": ["Stay hydrated", "Rest as needed"],
+            "safety_measures": ["Stay hydrated", "Rest as needed", "Monitor your symptoms"],
             "follow_up_questions": [
                 "How long have you had these symptoms?",
                 "Do you have any other symptoms?",
@@ -921,67 +691,30 @@ def create_fallback_response(description, symptoms, is_emergency, intent, thread
     
     # Phase 2: Analysis
     return {
-        "response_text": f"Based on your symptoms ({symptom_text}), I recommend seeking medical attention for proper evaluation and treatment.",
+        "response_text": f"Based on your symptoms ({symptom_text}), I recommend seeking medical attention for proper evaluation and treatment. While I can provide guidance, a healthcare professional can give you the best assessment.",
         "urgency": "moderate",
         "possible_conditions": [
-            {"name": "Common Health Issue", "description": f"Your symptoms may indicate a condition that requires medical evaluation."}
+            {"name": "Medical Condition", "description": f"Your symptoms may indicate a condition that requires medical evaluation."}
         ],
         "safety_measures": [
             "Monitor your symptoms closely",
             "Stay hydrated and get adequate rest",
-            "Seek medical attention if symptoms worsen"
+            "Seek medical attention if symptoms worsen",
+            "Contact a healthcare provider for evaluation"
         ],
         "follow_up_questions": [
-            "Have your symptoms changed?",
-            "Are you experiencing anything else?"
+            "Have your symptoms changed since they started?",
+            "Are you experiencing any other symptoms?"
         ],
         "send_sos": False
     }
 
-def generate_follow_up_questions(accumulated_symptoms: List[str]) -> List[str]:
-    """Generate follow-up questions based on symptoms"""
-    if not OPENAI_AVAILABLE:
-        if not accumulated_symptoms:
-            return ["Do you have any symptoms?", "When did your symptoms start?"]
-        return ["Have your symptoms changed since they started?", "Are you experiencing any other symptoms?"]
-    
-    try:
-        symptoms_text = ", ".join(accumulated_symptoms) if accumulated_symptoms else "no symptoms reported yet"
-        messages = [
-            {
-                "role": "system",
-                "content": (
-                    "You are a medical triage assistant. Generate 2–3 targeted follow-up questions to clarify symptoms "
-                    "or uncover related ones. Avoid asking about symptoms already reported. "
-                    "Return a JSON object with a 'questions' key containing a list of question strings."
-                )
-            },
-            {
-                "role": "user",
-                "content": f"The user has reported these symptoms so far: {symptoms_text}. Generate follow-up questions."
-            }
-        ]
-        response_text = call_openai_chat(messages, model="gpt-4", temperature=0.3, max_tokens=150)
-        if response_text:
-            try:
-                result = json.loads(response_text)
-                return result.get("questions", [])
-            except (json.JSONDecodeError, KeyError):
-                logger.error("JSON parsing error in follow-up questions")
-    except Exception as e:
-        logger.error(f"Error generating follow-up questions: {e}")
-
-    # Simple fallback
-    if not accumulated_symptoms:
-        return ["Do you have any symptoms?", "When did your symptoms start?"]
-    return ["Have your symptoms changed since they started?", "Are you experiencing any other symptoms?"]
-
 # ======================
-# Main Triage Function
+# Main Triage Function - COMPLETELY REWRITTEN
 # ======================
 
 async def triage_main(description: str, thread_id: Optional[str] = None) -> Dict:
-    """Main triage processing function"""
+    """Main triage processing function - FIXED"""
     try:
         description = description.strip()
         logger.info(f"=== TRIAGE REQUEST === Description: '{description[:50]}...'")
@@ -1006,23 +739,27 @@ async def triage_main(description: str, thread_id: Optional[str] = None) -> Dict
         # Detect intent
         intent = detect_intent(description, thread_context)
         
-        # Check for emergency
+        # Get accumulated symptoms (current + previous)
         all_symptoms_combined = thread_context.all_symptoms + current_symptoms
-        is_emergency = detect_emergency(description, all_symptoms_combined)
+        accumulated_unique_symptoms = list(set(all_symptoms_combined))
         
-        # Determine if should query Pinecone
-        should_query_pinecone = (
-            len(set(thread_context.all_symptoms + current_symptoms)) >= MIN_SYMPTOMS_FOR_PINECONE and 
-            thread_context.conversation_count >= 1
+        # Check for emergency - IMPROVED LOGIC
+        is_emergency = detect_emergency(description, accumulated_unique_symptoms)
+        
+        # Determine if should query Pinecone - FIXED LOGIC
+        should_query_pinecone = should_query_pinecone_database(
+            accumulated_unique_symptoms, 
+            thread_context.conversation_count, 
+            description
         ) or is_emergency
         
-        logger.info(f"Intent: {intent}, Symptoms: {current_symptoms}, "
-                   f"Total symptoms: {len(set(thread_context.all_symptoms + current_symptoms))}, "
-                   f"Conversation count: {thread_context.conversation_count}, "
-                   f"Should query Pinecone: {should_query_pinecone}, Emergency: {is_emergency}")
+        logger.info(f"Intent: {intent}, Current symptoms: {current_symptoms}")
+        logger.info(f"Total unique symptoms: {accumulated_unique_symptoms} (count: {len(accumulated_unique_symptoms)})")
+        logger.info(f"Conversation count: {thread_context.conversation_count}")
+        logger.info(f"Should query Pinecone: {should_query_pinecone}, Emergency: {is_emergency}")
         
-        # Generate response
-        ai_result = await generate_openai_response(description, thread_context, intent)
+        # Generate response using OpenAI
+        ai_result = await generate_openai_response(description, thread_context, intent, accumulated_unique_symptoms)
         
         # Use AI result or fallback
         if ai_result:
@@ -1032,22 +769,26 @@ async def triage_main(description: str, thread_id: Optional[str] = None) -> Dict
                 description, current_symptoms, is_emergency, intent, thread_context
             )
         
-        # Query Pinecone if needed
-        possible_conditions = []
+        # Query Pinecone if needed - ACTUALLY IMPLEMENTED
+        possible_conditions = result.get("possible_conditions", [])
         if should_query_pinecone and PINECONE_AVAILABLE:
             try:
-                all_symptoms = list(set(thread_context.all_symptoms + current_symptoms))
-                query_text = f"Symptoms: {', '.join(all_symptoms)}"
-                matches = query_pinecone_index(query_text, all_symptoms)
+                query_text = f"Symptoms: {', '.join(accumulated_unique_symptoms)}"
+                logger.info(f"QUERYING PINECONE: {query_text}")
+                matches = query_pinecone_index(query_text, accumulated_unique_symptoms)
                 if matches:
-                    possible_conditions = rank_conditions(matches, all_symptoms)
-                logger.info(f"Pinecone query completed. Found {len(possible_conditions)} conditions.")
+                    pinecone_conditions = rank_conditions(matches, accumulated_unique_symptoms)
+                    if pinecone_conditions:
+                        possible_conditions = pinecone_conditions
+                        logger.info(f"Pinecone returned {len(pinecone_conditions)} conditions")
+                    else:
+                        logger.warning("No conditions after ranking")
+                else:
+                    logger.warning("No matches from Pinecone")
             except Exception as e:
                 logger.error(f"Pinecone query failed: {e}")
-        
-        # Override possible_conditions if we got them from Pinecone
-        if possible_conditions:
-            result["possible_conditions"] = possible_conditions
+        elif should_query_pinecone and not PINECONE_AVAILABLE:
+            logger.warning("Would query Pinecone but it's not available")
         
         # Store the conversation (this is where symptoms get accumulated!)
         thread_context.add_message(description, result.get("response_text", ""), current_symptoms)
@@ -1059,7 +800,7 @@ async def triage_main(description: str, thread_id: Optional[str] = None) -> Dict
         response = {
             "success": True,
             "text": result.get("response_text", ""),
-            "possible_conditions": result.get("possible_conditions", []),
+            "possible_conditions": possible_conditions,
             "safety_measures": result.get("safety_measures", [
                 "Monitor your symptoms closely",
                 "Stay hydrated and get adequate rest",
@@ -1072,7 +813,7 @@ async def triage_main(description: str, thread_id: Optional[str] = None) -> Dict
                 "location": "Unknown"
             },
             "send_sos": result.get("send_sos", False),
-            "follow_up_questions": result.get("follow_up_questions", generate_follow_up_questions(thread_context.all_symptoms)),
+            "follow_up_questions": result.get("follow_up_questions", []),
             "thread_id": thread_id,
             "symptoms_count": len(thread_context.all_symptoms),  # This should now be correct!
             "should_query_pinecone": should_query_pinecone,
@@ -1080,9 +821,9 @@ async def triage_main(description: str, thread_id: Optional[str] = None) -> Dict
             "intent": intent
         }
         
-        logger.info(f"Triage completed. Thread: {thread_id}, "
-                   f"Symptoms count: {len(thread_context.all_symptoms)}, "
-                   f"Conversation: {thread_context.conversation_count}")
+        logger.info(f"Triage completed. Thread: {thread_id}")
+        logger.info(f"Final symptoms count: {len(thread_context.all_symptoms)}")
+        logger.info(f"Pinecone queried: {should_query_pinecone}, Conditions found: {len(possible_conditions)}")
         return response
         
     except Exception as e:
@@ -1101,67 +842,23 @@ async def triage_main(description: str, thread_id: Optional[str] = None) -> Dict
         }
 
 # ======================
-# Health Analysis Function
+# Health Facts
 # ======================
 
-def process_user_message(user_input):
-    """Process user message for health analysis"""
-    try:
-        # Detect language
-        detected_language_code = detect_language(user_input)
-        detected_language = SUPPORTED_LANGUAGES.get(detected_language_code, "English")
-        
-        # Translate to English if needed
-        if detected_language_code != "en":
-            english_translation = translate_to_english(user_input, detected_language_code)
-        else:
-            english_translation = None
-        
-        # Extract symptoms (use sync version for this function)
-        text_to_analyze = english_translation if english_translation else user_input
-        
-        # Use fallback extraction for sync context
-        symptom_data = extract_symptoms_fallback(text_to_analyze)
-        symptoms = symptom_data['symptoms']
-        
-        # Generate response based on symptoms
-        if symptoms:
-            symptom_text = ", ".join(symptoms)
-            response = f"I understand you're experiencing {symptom_text}. "
-        else:
-            response = "I understand you have health concerns. "
-            
-        response += ("It's important to monitor your symptoms carefully. "
-                    "If your symptoms are severe, getting worse, or you're concerned, "
-                    "please consult with a healthcare professional or visit a clinic. "
-                    "For emergencies, call 112 (Nigeria emergency number). "
-                    "Stay hydrated, get rest, and take care of yourself.")
-        
-        # Translate response back if needed
-        if detected_language_code != "en":
-            response = translate_to_language(response, detected_language_code)
-        
-        return {
-            "success": True,
-            "detected_language": detected_language,
-            "language_code": detected_language_code,
-            "original_text": user_input,
-            "english_translation": english_translation,
-            "health_analysis": {
-                "symptoms": symptoms,
-                "body_parts": [],
-                "time_expressions": [symptom_data['duration']] if symptom_data['duration'] else [],
-                "medications": []
-            },
-            "response": response
-        }
-        
-    except Exception as e:
-        logger.error(f"Error in process_user_message: {e}")
-        return {
-            "success": False,
-            "message": "Sorry, I encountered an error processing your request. Please try again."
-        }
+HEALTH_FACTS = {
+    "general health": [
+        {"title": "Stay Hydrated", "description": "Drink at least 8 glasses of water daily to maintain proper body functions and overall health."},
+        {"title": "Get Quality Sleep", "description": "Adults need 7-9 hours of quality sleep per night for optimal health and wellbeing."},
+        {"title": "Exercise Regularly", "description": "Aim for at least 150 minutes of moderate physical activity per week for cardiovascular health."},
+        {"title": "Eat Balanced Meals", "description": "Include fruits, vegetables, whole grains, and lean proteins in your daily diet."},
+        {"title": "Manage Stress", "description": "Practice stress-reduction techniques like meditation, deep breathing, or regular exercise."}
+    ],
+    "nutrition": [
+        {"title": "Eat Rainbow Foods", "description": "Include colorful fruits and vegetables in your diet for diverse nutrients and vitamins."},
+        {"title": "Limit Processed Foods", "description": "Reduce intake of processed and sugary foods to maintain optimal health."},
+        {"title": "Portion Control", "description": "Practice mindful eating and appropriate portion sizes for better digestion."}
+    ]
+}
 
 # ======================
 # Flask Routes
@@ -1170,17 +867,15 @@ def process_user_message(user_input):
 @app.route('/')
 def home():
     return jsonify({
-        "message": "HealthMate AI Backend API - Complete Integration",
+        "message": "HealthMate AI Backend API - Fixed Version",
         "status": "running",
-        "version": "2.1.0",
+        "version": "2.2.0",
         "endpoints": [
             "/api/health - GET - Health check",
             "/api/health/languages - GET - Get supported languages", 
             "/api/health/analyze - POST - Legacy health analysis",
             "/api/health/facts - GET - Get health facts",
             "/api/triage - POST - Advanced triage analysis with context",
-            "/api/awareness - GET - Health awareness content",
-            "/api/translate - POST - Translation service",
             "/api/test/symptoms - POST - Test symptom extraction",
             "/api/debug/thread/<id> - GET - Debug thread context"
         ],
@@ -1214,7 +909,7 @@ def get_supported_languages():
 
 @app.route('/api/triage', methods=['POST'])
 def triage_endpoint():
-    """Enhanced triage analysis endpoint with proper context management"""
+    """Fixed triage analysis endpoint with proper context management"""
     try:
         if not request.is_json:
             return jsonify({'success': False, 'error': 'Request must be JSON'}), 400
@@ -1262,8 +957,37 @@ def analyze_health_query():
         if not user_message or not user_message.strip():
             return jsonify({'success': False, 'error': 'Message cannot be empty'}), 400
         
-        result = process_user_message(user_message)
-        return jsonify(result)
+        # Use fallback extraction for this legacy endpoint
+        symptom_data = extract_symptoms_fallback(user_message)
+        symptoms = symptom_data['symptoms']
+        
+        # Generate basic response
+        if symptoms:
+            symptom_text = ", ".join(symptoms)
+            response = f"I understand you're experiencing {symptom_text}. "
+        else:
+            response = "I understand you have health concerns. "
+            
+        response += ("It's important to monitor your symptoms carefully. "
+                    "If your symptoms are severe, getting worse, or you're concerned, "
+                    "please consult with a healthcare professional or visit a clinic. "
+                    "For emergencies, call 112 (Nigeria emergency number). "
+                    "Stay hydrated, get rest, and take care of yourself.")
+        
+        return jsonify({
+            "success": True,
+            "detected_language": "English",
+            "language_code": "en",
+            "original_text": user_message,
+            "english_translation": None,
+            "health_analysis": {
+                "symptoms": symptoms,
+                "body_parts": [],
+                "time_expressions": [symptom_data['duration']] if symptom_data['duration'] else [],
+                "medications": []
+            },
+            "response": response
+        })
     
     except Exception as e:
         logger.error(f"Error in analyze_health_query: {str(e)}")
@@ -1273,99 +997,6 @@ def analyze_health_query():
             'message': 'Please try again later'
         }), 500
 
-@app.route('/api/awareness', methods=['GET'])
-def awareness_endpoint():
-    """Health awareness content endpoint"""
-    try:
-        category = request.args.get("category", None)
-        random_count = request.args.get("random", None)
-        count = int(request.args.get("count", 3))
-
-        # Random articles
-        if random_count is not None:
-            try:
-                rc = int(random_count)
-            except ValueError:
-                return jsonify({"error": "Invalid random count"}), 400
-
-            contents = get_random_awareness_content(count=rc)
-            return jsonify({"success": True, "random_count": rc, "articles": contents})
-
-        # Specific category
-        if category:
-            if category not in HEALTH_CATEGORIES:
-                return jsonify({
-                    "success": False,
-                    "error": f"Unknown category '{category}'. Valid options: {HEALTH_CATEGORIES}"
-                }), 400
-
-            articles = generate_awareness_content(category, count=count)
-            return jsonify({
-                "success": True,
-                "category": category,
-                "count": count,
-                "articles": articles
-            })
-
-        # List all categories
-        return jsonify({
-            "success": True,
-            "categories": HEALTH_CATEGORIES
-        })
-
-    except Exception as e:
-        logger.error(f"Error in /awareness endpoint: {e}")
-        return jsonify({
-            "success": False,
-            "error": "Internal server error"
-        }), 500
-
-@app.route('/api/translate', methods=['POST'])
-def translate_endpoint():
-    """Translation service endpoint"""
-    try:
-        if not request.is_json:
-            return jsonify({"success": False, "error": "Request must be JSON"}), 400
-
-        data = request.json
-        orig_text = data.get("text", "").strip()
-        if not orig_text:
-            return jsonify({"success": False, "error": "Text cannot be empty"}), 400
-
-        target_lang = data.get("to", "en").lower()
-        source_lang = data.get("from", "auto").lower()
-
-        # Detect source language if "auto"
-        if source_lang == "auto":
-            detected = detect_language(orig_text)
-            source_lang = detected
-        else:
-            detected = source_lang
-
-        # Translate to English if needed
-        if source_lang != "en":
-            english_text = translate_to_english(orig_text, source_lang)
-        else:
-            english_text = orig_text
-
-        # Translate to target language if needed
-        if target_lang != "en":
-            back_text = translate_to_language(english_text, target_lang)
-        else:
-            back_text = english_text
-
-        return jsonify({
-            "success": True,
-            "detected_language": source_lang,
-            "original_text": orig_text,
-            "translated_to_english": english_text if source_lang != "en" else None,
-            "translated_to_target": back_text
-        })
-
-    except Exception as e:
-        logger.error(f"Error in /translate endpoint: {e}")
-        return jsonify({"success": False, "error": "Internal server error"}), 500
-
 @app.route('/api/health/facts', methods=['GET'])
 def get_health_facts():
     """Get health facts"""
@@ -1373,17 +1004,10 @@ def get_health_facts():
         topic = request.args.get('topic', 'general health')
         count = min(int(request.args.get('count', 3)), 5)
         
-        # Generate facts using awareness content system
-        if topic in HEALTH_CATEGORIES:
-            facts_content = generate_awareness_content(topic, count)
-            facts = [{"title": item["title"], "description": item["content"]} for item in facts_content]
+        if topic.lower() in HEALTH_FACTS:
+            facts = HEALTH_FACTS[topic.lower()][:count]
         else:
-            # Fallback facts
-            facts = [
-                {"title": "Stay Hydrated", "description": "Drink at least 8 glasses of water daily to maintain proper body functions."},
-                {"title": "Get Quality Sleep", "description": "Adults need 7-9 hours of quality sleep per night for optimal health and wellbeing."},
-                {"title": "Exercise Regularly", "description": "Aim for at least 150 minutes of moderate physical activity per week."}
-            ][:count]
+            facts = HEALTH_FACTS['general health'][:count]
         
         return jsonify({
             'success': True,
@@ -1396,7 +1020,7 @@ def get_health_facts():
         return jsonify({
             'success': True,
             'topic': 'general health',
-            'facts': [{"title": "Stay Healthy", "description": "Maintain a balanced lifestyle with good nutrition, exercise, and adequate rest."}]
+            'facts': HEALTH_FACTS['general health'][:3]
         })
 
 # Test endpoint to verify symptom extraction
