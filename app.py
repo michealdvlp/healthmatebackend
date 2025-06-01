@@ -1,5 +1,4 @@
 import os
-import signal
 import json
 import logging
 import re
@@ -22,12 +21,11 @@ app = Flask(__name__)
 CORS(app, origins="*")
 
 # -----------------------------------
-# Hard-coded Configuration (same as testtriage.py)
+# Configuration (same as testtriage.py)
 # -----------------------------------
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 PINECONE_API_KEY = os.getenv("PINECONE_API_KEY") 
 PINECONE_ENV = "us-east1-gcp"
-ASSISTANT_ID = "asst_pAhSF6XJsj60efD9GEVdEG5n"
 EMBEDDING_MODEL = "text-embedding-ada-002"
 INDEX_NAME = "triage-index"
 MAX_RETRIES = 3
@@ -49,58 +47,43 @@ RED_FLAGS = [
 ]
 
 # -----------------------------------
-# Initialize OpenAI (synchronous for Vercel compatibility)
+# Lazy-load clients to avoid initialization errors
 # -----------------------------------
-import openai
-openai_client = openai.OpenAI(api_key=OPENAI_API_KEY)
+_openai_client = None
+_pinecone_index = None
 
-# -----------------------------------
-# Initialize Pinecone (same as testtriage.py)
-# -----------------------------------
-from pinecone import Pinecone
+def get_openai_client():
+    """Lazy-load OpenAI client using older compatible version"""
+    global _openai_client
+    if _openai_client is None:
+        import openai
+        openai.api_key = OPENAI_API_KEY
+        _openai_client = openai
+    return _openai_client
 
-try:
-    pc = Pinecone(api_key=PINECONE_API_KEY)
-    index = pc.Index(name=INDEX_NAME)
-    logger.info(f"Initialized Pinecone index '{INDEX_NAME}' in environment '{PINECONE_ENV}'")
-except Exception as e:
-    logger.error(f"Failed to initialize Pinecone index: {e}")
-    raise
-
-# -----------------------------------
-# Pydantic models (converted to simple dicts for Flask)
-# -----------------------------------
-def create_triage_response(
-    text: str,
-    possible_conditions: List[Dict] = None,
-    safety_measures: List[str] = None,
-    triage: Dict = None,
-    send_sos: bool = False,
-    follow_up_questions: List[str] = None,
-    thread_id: str = "",
-    symptoms_count: int = 0,
-    should_query_pinecone: bool = False
-) -> Dict:
-    return {
-        "text": text,
-        "possible_conditions": possible_conditions or [],
-        "safety_measures": safety_measures or [],
-        "triage": triage or {"type": "", "location": "Unknown"},
-        "send_sos": send_sos,
-        "follow_up_questions": follow_up_questions or [],
-        "thread_id": thread_id,
-        "symptoms_count": symptoms_count,
-        "should_query_pinecone": should_query_pinecone
-    }
+def get_pinecone_index():
+    """Lazy-load Pinecone index"""
+    global _pinecone_index
+    if _pinecone_index is None:
+        try:
+            import pinecone
+            pinecone.init(api_key=PINECONE_API_KEY, environment=PINECONE_ENV)
+            _pinecone_index = pinecone.Index(INDEX_NAME)
+            logger.info(f"Initialized Pinecone index '{INDEX_NAME}'")
+        except Exception as e:
+            logger.error(f"Failed to initialize Pinecone: {e}")
+            raise
+    return _pinecone_index
 
 # ======================
-# Utility Functions (EXACT same logic as testtriage.py but synchronous)
+# Utility Functions (adapted for older OpenAI API)
 # ======================
 
 def validate_thread(thread_id: str) -> bool:
-    """Check if an OpenAI thread ID is valid."""
+    """Check if an OpenAI thread ID is valid using older API"""
     try:
-        openai_client.beta.threads.retrieve(thread_id=thread_id)
+        openai = get_openai_client()
+        openai.beta.threads.retrieve(thread_id)
         logger.info(f"Thread {thread_id} is valid.")
         return True
     except Exception as e:
@@ -108,9 +91,10 @@ def validate_thread(thread_id: str) -> bool:
         return False
 
 def get_thread_context(thread_id: str) -> Dict:
-    """Retrieve all past user messages in this thread."""
+    """Retrieve all past user messages in this thread using older API"""
     try:
-        messages = openai_client.beta.threads.messages.list(thread_id=thread_id, order='asc')
+        openai = get_openai_client()
+        messages = openai.beta.threads.messages.list(thread_id=thread_id, order='asc')
         user_messages = []
         assistant_count = 0
         all_symptoms = []
@@ -119,7 +103,7 @@ def get_thread_context(thread_id: str) -> Dict:
         for msg in messages.data:
             if msg.role == "user":
                 content = ""
-                if msg.content and hasattr(msg.content[0], "text"):
+                if msg.content and len(msg.content) > 0:
                     content = msg.content[0].text.value
                 if not content:
                     logger.warning(f"Empty or malformed user message in thread {thread_id}")
@@ -152,7 +136,7 @@ def get_thread_context(thread_id: str) -> Dict:
         return {"user_messages": [], "assistant_responses": 0, "all_symptoms": [], "max_severity": 0}
 
 def detect_intent(description: str, thread_id: Optional[str] = None) -> Dict:
-    """Use GPT-4o-mini to detect intent and extract any symptom keywords."""
+    """Use GPT-4 to detect intent using older API"""
     try:
         has_prior_symptoms = False
         if thread_id and validate_thread(thread_id):
@@ -174,8 +158,9 @@ def detect_intent(description: str, thread_id: Optional[str] = None) -> Dict:
             "Output: {'intent': ['medical'], 'symptoms': ['nausea']}"
         )
 
-        response = openai_client.chat.completions.create(
-            model="gpt-4o-mini",
+        openai = get_openai_client()
+        response = openai.ChatCompletion.create(
+            model="gpt-4",
             messages=[
                 {"role": "system", "content": prompt},
                 {"role": "user", "content": description}
@@ -189,17 +174,9 @@ def detect_intent(description: str, thread_id: Optional[str] = None) -> Dict:
             intents = result.get("intent", ["medical"])
             symptoms = result.get("symptoms", [])
         except (json.JSONDecodeError, KeyError) as e:
-            logger.error(f"JSON parsing error in intent detection: {e}. Falling back to keyword method.")
+            logger.error(f"JSON parsing error in intent detection: {e}")
             intents = ["medical"]
             symptoms = []
-            symptom_keywords = [
-                "pain", "bleeding", "fever", "cough", "discomfort", "hurt", "ache", "nausea",
-                "vomiting", "dizziness", "swelling", "shortness of breath", "palpitations"
-            ]
-            desc_lower = description.lower()
-            for kw in symptom_keywords:
-                if kw in desc_lower:
-                    symptoms.append(kw)
 
         if has_prior_symptoms and "medical" not in intents:
             intents.append("medical")
@@ -211,25 +188,18 @@ def detect_intent(description: str, thread_id: Optional[str] = None) -> Dict:
         if not intents:
             intents = ["medical"]
 
-        if not symptoms and "non_medical" not in intents:
-            non_medical_keywords = ["what can you do", "hi", "hello", "how are you"]
-            if any(kw in description.lower() for kw in non_medical_keywords):
-                logger.info("Fallback: Non-medical due to greeting keywords.")
-                intents = ["non_medical"]
-
         return {"intent": intents, "symptoms": symptoms}
 
     except Exception as e:
-        logger.error(f"Intent detection error: {e}. Using fallback keyword-based approach.")
-        # Fallback logic same as testtriage.py
+        logger.error(f"Intent detection error: {e}")
         return {"intent": ["medical"], "symptoms": []}
 
 def extract_symptoms_comprehensive(description: str) -> Dict:
-    """**Now: fully GPT-based extraction** (exact same as testtriage.py)"""
+    """Extract symptoms using GPT-4 with older API"""
     try:
         description_lower = description.lower()
 
-        # 1) Extract duration phrases and severity scores via regex
+        # Extract duration and severity (same regex logic)
         duration = None
         duration_patterns = [
             r"(since|started|began)\s*(yesterday|last night|today|[0-9]+\s*(day|hour|minute|week|month)s?\s*ago)",
@@ -256,7 +226,7 @@ def extract_symptoms_comprehensive(description: str) -> Dict:
         if m:
             severity = int(m.group(1))
 
-        # 2) Now call GPT to extract symptoms exclusively
+        # GPT symptom extraction using older API
         prompt = (
             "You are a medical symptom extraction specialist. Extract ONLY specific, clinically relevant symptoms from the text. "
             "Do NOT include vague terms like 'pain' without context or duration descriptions. "
@@ -265,20 +235,22 @@ def extract_symptoms_comprehensive(description: str) -> Dict:
             f"Text: \"{description}\""
         )
 
-        response = openai_client.chat.completions.create(
-            model="gpt-4o-mini",
+        openai = get_openai_client()
+        response = openai.ChatCompletion.create(
+            model="gpt-4",
             messages=[
                 {"role": "system", "content": prompt},
                 {"role": "user", "content": "Extract symptoms now."}
             ],
-            temperature=0
+            temperature=0,
+            max_tokens=200
         )
 
         try:
             gpt_symptoms = json.loads(response.choices[0].message.content.strip())
             if not isinstance(gpt_symptoms, list):
                 raise ValueError("Expected a JSON array of strings")
-            # Normalize to lowercase, strip whitespace
+            
             unique_symptoms = []
             seen = set()
             for s in gpt_symptoms:
@@ -287,10 +259,10 @@ def extract_symptoms_comprehensive(description: str) -> Dict:
                     seen.add(sc)
                     unique_symptoms.append(sc)
         except Exception as e:
-            logger.error(f"GPT returned non-JSON or invalid format: {e}. No symptoms extracted.")
+            logger.error(f"GPT parsing error: {e}")
             unique_symptoms = []
 
-        logger.info(f"Extracted symptoms (GPT): {unique_symptoms}, Duration: {duration}, Severity: {severity}")
+        logger.info(f"Extracted symptoms: {unique_symptoms}, Duration: {duration}, Severity: {severity}")
         return {"symptoms": unique_symptoms, "duration": duration, "severity": severity}
 
     except Exception as e:
@@ -298,7 +270,7 @@ def extract_symptoms_comprehensive(description: str) -> Dict:
         return {"symptoms": [], "duration": None, "severity": 0}
 
 def generate_follow_up_questions(context: Dict) -> List[str]:
-    """Given context with 'all_symptoms', ask GPT to propose 2–3 follow-up questions."""
+    """Generate follow-up questions using older OpenAI API"""
     try:
         symptoms = context.get("all_symptoms", [])
         symptoms_text = ", ".join(symptoms) if symptoms else "no symptoms reported yet"
@@ -310,8 +282,9 @@ def generate_follow_up_questions(context: Dict) -> List[str]:
             "Example: {'questions': ['Do you have any nausea or vomiting?', 'Are you experiencing any fever?']}"
         )
 
-        response = openai_client.chat.completions.create(
-            model="gpt-4o-mini",
+        openai = get_openai_client()
+        response = openai.ChatCompletion.create(
+            model="gpt-4",
             messages=[
                 {"role": "system", "content": prompt},
                 {"role": "user", "content": "Generate follow-up questions."}
@@ -324,7 +297,7 @@ def generate_follow_up_questions(context: Dict) -> List[str]:
             result = json.loads(response.choices[0].message.content.strip())
             questions = result.get("questions", [])
         except (json.JSONDecodeError, KeyError):
-            logger.error("JSON parsing error in follow-up questions. Using fallback questions.")
+            logger.error("JSON parsing error in follow-up questions")
             questions = ["Do you have any other symptoms?", "When did your symptoms start?"]
 
         return questions
@@ -334,7 +307,7 @@ def generate_follow_up_questions(context: Dict) -> List[str]:
         return ["Do you have any other symptoms?", "When did your symptoms start?"]
 
 def is_red_flag(full_text: str, severity: int = 0) -> bool:
-    """Check if text contains any red-flag keywords."""
+    """Check if text contains any red-flag keywords"""
     lt = full_text.lower()
     for rf in RED_FLAGS:
         if rf in lt:
@@ -346,7 +319,7 @@ def is_red_flag(full_text: str, severity: int = 0) -> bool:
     return False
 
 def should_query_pinecone_database(context: Dict) -> bool:
-    """Decide whether to query Pinecone."""
+    """Decide whether to query Pinecone"""
     all_symptoms = context.get("all_symptoms", [])
     symptom_count = len(all_symptoms)
     max_severity = context.get("max_severity", 0)
@@ -368,15 +341,16 @@ def should_query_pinecone_database(context: Dict) -> bool:
         logger.info("User explicitly asked for condition identification → querying Pinecone.")
         return True
 
-    logger.info(f"Not querying Pinecone: only {symptom_count} symptoms, no explicit condition request.")
+    logger.info(f"Not querying Pinecone: only {symptom_count} symptoms")
     return False
 
 def get_embeddings(texts: List[str], model: str = EMBEDDING_MODEL) -> Optional[List[List[float]]]:
-    """Wrapper around openai_client.embeddings.create(...) with retries."""
+    """Get embeddings using older OpenAI API"""
     for attempt in range(MAX_RETRIES):
         try:
-            response = openai_client.embeddings.create(input=texts, model=model)
-            return [item.embedding for item in response.data]
+            openai = get_openai_client()
+            response = openai.Embedding.create(input=texts, model=model)
+            return [item['embedding'] for item in response['data']]
         except Exception as e:
             logger.error(f"Embedding attempt {attempt+1}/{MAX_RETRIES} failed: {e}")
             if attempt == MAX_RETRIES - 1:
@@ -384,20 +358,21 @@ def get_embeddings(texts: List[str], model: str = EMBEDDING_MODEL) -> Optional[L
     return None
 
 def query_index(query_text: str, symptoms: List[str], context: Dict, top_k: int = 50) -> List[Dict]:
-    """Run a Pinecone vector query and return matches."""
+    """Run a Pinecone vector query using older API"""
     query_embedding = get_embeddings([query_text])
     if not query_embedding:
         logger.error("Failed to generate query embedding.")
         return []
 
     try:
+        index = get_pinecone_index()
         response = index.query(
             vector=query_embedding[0],
             top_k=top_k,
             include_metadata=True
         )
         matches = response.get("matches", [])
-        logger.info(f"Pinecone returned {len(matches)} raw matches for '{query_text[:50]}...'")
+        logger.info(f"Pinecone returned {len(matches)} raw matches")
 
         unique_by_disease = {}
         for m in matches:
@@ -417,13 +392,14 @@ def query_index(query_text: str, symptoms: List[str], context: Dict, top_k: int 
         return []
 
 def generate_detailed_condition_description(condition_name: str, user_symptoms: List[str]) -> str:
-    """Ask GPT-4o-mini to give a simple 2-3 sentence description."""
+    """Generate condition description using older OpenAI API"""
     try:
         symptoms_text = ", ".join(user_symptoms)
         for attempt in range(MAX_RETRIES):
             try:
-                response = openai_client.chat.completions.create(
-                    model="gpt-4o-mini",
+                openai = get_openai_client()
+                response = openai.ChatCompletion.create(
+                    model="gpt-4",
                     messages=[
                         {
                             "role": "system",
@@ -445,13 +421,12 @@ def generate_detailed_condition_description(condition_name: str, user_symptoms: 
                 )
                 desc = response.choices[0].message.content.strip()
                 if desc and len(desc) > 20:
-                    logger.info(f"Generated description for {condition_name}: {desc}")
+                    logger.info(f"Generated description for {condition_name}")
                     return desc
-                logger.warning(f"Description too short for {condition_name}. Retrying...")
             except Exception as e:
-                logger.error(f"Error generating description for {condition_name} attempt {attempt+1}: {e}")
+                logger.error(f"Error generating description attempt {attempt+1}: {e}")
 
-        # Fallback dictionary (same as testtriage.py)
+        # Fallback descriptions
         fallback = {
             "gastritis": "Gastritis is inflammation of the stomach lining that can cause abdominal pain and nausea, often triggered by stress, spicy foods, or infections like H. pylori.",
             "appendicitis": "Appendicitis is inflammation of the appendix, causing sharp abdominal pain that may start near the navel and shift to the lower right side, often requiring urgent medical attention.",
@@ -466,7 +441,7 @@ def generate_detailed_condition_description(condition_name: str, user_symptoms: 
         return f"{condition_name} may be related to your symptoms. Please consult a healthcare professional."
 
 def rank_conditions(matches: List[Dict], symptoms: List[str], context: Dict) -> List[Dict]:
-    """Given Pinecone matches, ask GPT for a short description of each."""
+    """Rank and format condition matches"""
     try:
         condition_data = []
         for match in matches:
@@ -492,7 +467,7 @@ def rank_conditions(matches: List[Dict], symptoms: List[str], context: Dict) -> 
         return []
 
 def generate_non_medical_response(thread_id: str) -> Dict:
-    """A canned hello message for non-medical greetings."""
+    """Generate non-medical greeting response"""
     response = {
         "text": (
             "Hi! I'm a medical triage assistant. I can help you assess symptoms and suggest possible health conditions. "
@@ -508,7 +483,8 @@ def generate_non_medical_response(thread_id: str) -> Dict:
         "should_query_pinecone": False
     }
     try:
-        openai_client.beta.threads.messages.create(
+        openai = get_openai_client()
+        openai.beta.threads.messages.create(
             thread_id=thread_id,
             role="assistant",
             content=json.dumps(response)
@@ -518,7 +494,7 @@ def generate_non_medical_response(thread_id: str) -> Dict:
     return response
 
 def generate_phase1_response(description: str, context: Dict, thread_id: str) -> Dict:
-    """Collect more symptoms: apologize and ask 2-3 follow-up questions."""
+    """Phase 1: Collect more symptoms"""
     try:
         symptoms = context["all_symptoms"]
         symptoms_text = ", ".join(symptoms) if symptoms else "no symptoms reported yet"
@@ -537,7 +513,8 @@ def generate_phase1_response(description: str, context: Dict, thread_id: str) ->
             "should_query_pinecone": False
         }
         try:
-            openai_client.beta.threads.messages.create(
+            openai = get_openai_client()
+            openai.beta.threads.messages.create(
                 thread_id=thread_id,
                 role="assistant",
                 content=json.dumps(response)
@@ -549,7 +526,7 @@ def generate_phase1_response(description: str, context: Dict, thread_id: str) ->
     except Exception as e:
         logger.error(f"Error generating Phase 1 response: {e}")
         return {
-            "text": "I'm sorry, I need more information to assist you. Please let me know:\n- Do you have any symptoms?",
+            "text": "I need more information. Please describe your symptoms.",
             "possible_conditions": [],
             "safety_measures": ["Stay calm and rest"],
             "triage": {"type": "clinic", "location": "Unknown"},
@@ -560,7 +537,7 @@ def generate_phase1_response(description: str, context: Dict, thread_id: str) ->
         }
 
 def generate_phase2_response(context: Dict, is_emergency: bool, thread_id: Optional[str] = None) -> Dict:
-    """We have enough symptoms (or a red flag). Query Pinecone if needed, rank conditions, and respond."""
+    """Phase 2: Provide detailed analysis with conditions"""
     try:
         symptoms = context["all_symptoms"]
         symptoms_text = ", ".join(symptoms) if symptoms else "your symptoms"
@@ -573,7 +550,7 @@ def generate_phase2_response(context: Dict, is_emergency: bool, thread_id: Optio
             query_text = f"Symptoms: {symptoms_text}"
             matches = query_index(query_text, symptoms, context)
             if not matches:
-                logger.warning("No Pinecone matches found, using fallback condition.")
+                logger.warning("No Pinecone matches found")
                 possible_conditions = [
                     {
                         "name": "Possible condition",
@@ -608,6 +585,7 @@ def generate_phase2_response(context: Dict, is_emergency: bool, thread_id: Optio
             "- Signs of severe dehydration",
             "- Any symptoms that are rapidly worsening"
         ])
+        
         self_care = [
             "Stay hydrated by drinking plenty of water",
             "Get adequate rest to help your body heal",
@@ -651,9 +629,11 @@ def generate_phase2_response(context: Dict, is_emergency: bool, thread_id: Optio
             "symptoms_count": symptom_count,
             "should_query_pinecone": should_query
         }
+        
         if thread_id:
             try:
-                openai_client.beta.threads.messages.create(
+                openai = get_openai_client()
+                openai.beta.threads.messages.create(
                     thread_id=thread_id,
                     role="assistant",
                     content=json.dumps(response)
@@ -677,7 +657,7 @@ def generate_phase2_response(context: Dict, is_emergency: bool, thread_id: Optio
         }
 
 def generate_contextual_response(description: str, thread_id: str, context: Dict) -> Dict:
-    """If the user is providing new context after we've already identified some symptoms."""
+    """Handle contextual follow-up responses"""
     try:
         symptoms = context.get("all_symptoms", [])
         symptoms_text = ", ".join(symptoms) if symptoms else "your previously mentioned symptoms"
@@ -718,7 +698,8 @@ def generate_contextual_response(description: str, thread_id: str, context: Dict
         }
 
         try:
-            openai_client.beta.threads.messages.create(
+            openai = get_openai_client()
+            openai.beta.threads.messages.create(
                 thread_id=thread_id,
                 role="assistant",
                 content=json.dumps(response)
@@ -742,11 +723,11 @@ def generate_contextual_response(description: str, thread_id: str, context: Dict
         }
 
 def should_continue_conversation(thread_id: str, description: str) -> bool:
-    """Decide if we should continue an ongoing conversation instead of resetting it."""
+    """Decide if we should continue an ongoing conversation"""
     try:
         context = get_thread_context(thread_id)
         if context["all_symptoms"] or context["assistant_responses"] > 0:
-            logger.info(f"Continuing conversation in thread {thread_id} (prior symptoms/responses).")
+            logger.info(f"Continuing conversation in thread {thread_id}")
             return True
 
         intent_result = detect_intent(description, thread_id)
@@ -764,13 +745,7 @@ def should_continue_conversation(thread_id: str, description: str) -> bool:
 
 def triage_main(description: str, thread_id: Optional[str] = None) -> Dict:
     """
-    The main triage function. Steps:
-      1. Validate or create a thread.
-      2. Append the user's message to that thread.
-      3. Recompute thread context (all past user symptoms, severity).
-      4. Run intent detection on the new message.
-      5. Decide if this is non-medical, contextual, or first-phase or second-phase.
-      6. Generate appropriate response JSON, append it to the thread, and return it.
+    The main triage function - exact same logic as testtriage.py
     """
     try:
         description = description.strip()
@@ -778,12 +753,14 @@ def triage_main(description: str, thread_id: Optional[str] = None) -> Dict:
 
         # 1) Validate or create a thread
         if not thread_id or not validate_thread(thread_id):
-            new_thread = openai_client.beta.threads.create()
+            openai = get_openai_client()
+            new_thread = openai.beta.threads.create()
             thread_id = new_thread.id
             logger.info(f"Created new thread ID: {thread_id}")
 
         # 2) Append user message
-        openai_client.beta.threads.messages.create(
+        openai = get_openai_client()
+        openai.beta.threads.messages.create(
             thread_id=thread_id,
             role="user",
             content=description
@@ -842,18 +819,20 @@ def triage_main(description: str, thread_id: Optional[str] = None) -> Dict:
 @app.route('/')
 def home():
     return jsonify({
-        "message": "HealthMate AI Backend API - Exact testtriage.py Implementation",
+        "message": "HealthMate AI Backend API - testtriage.py Compatible",
         "status": "running", 
-        "version": "4.0.0",
+        "version": "5.0.0",
         "endpoints": [
             "/triage - POST - Advanced medical triage analysis (same as testtriage.py)",
             "/health - GET - Health check"
-        ]
+        ],
+        "openai_version": "0.28.1",
+        "pinecone_version": "2.2.4"
     })
 
 @app.route('/health')
 def health_check():
-    """Simple health check endpoint."""
+    """Simple health check endpoint"""
     return {"status": "healthy", "timestamp": str(datetime.now())}
 
 @app.route('/triage', methods=['POST'])
