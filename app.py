@@ -75,16 +75,29 @@ if OPENAI_AVAILABLE and OPENAI_API_KEY:
     except Exception as e:
         logger.error(f"Failed to initialize OpenAI client: {e}")
 
-# Initialize Pinecone
+# Initialize Pinecone (Updated for new pinecone package)
 pc = None
 index = None
 if PINECONE_AVAILABLE and PINECONE_API_KEY:
     try:
+        # Updated initialization for new pinecone package
         pc = Pinecone(api_key=PINECONE_API_KEY)
-        index = pc.Index(name=INDEX_NAME)
-        logger.info(f"Pinecone index '{INDEX_NAME}' initialized")
+        
+        # Check if index exists, if not create it (optional)
+        try:
+            index = pc.Index(INDEX_NAME)
+            # Test the index connection
+            index.describe_index_stats()
+            logger.info(f"Pinecone index '{INDEX_NAME}' connected successfully")
+        except Exception as index_error:
+            logger.error(f"Could not connect to Pinecone index '{INDEX_NAME}': {index_error}")
+            logger.info("Available indexes:", pc.list_indexes().names() if hasattr(pc, 'list_indexes') else "Unknown")
+            index = None
+            
     except Exception as e:
         logger.error(f"Failed to initialize Pinecone: {e}")
+        pc = None
+        index = None
 
 # Supported languages
 SUPPORTED_LANGUAGES = {
