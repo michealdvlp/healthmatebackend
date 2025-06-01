@@ -2,18 +2,12 @@
 flask==2.3.2
 flask-cors==4.0.0
 
-# OpenAI Integration
-openai==1.3.0
+# OpenAI Integration (older stable version for Vercel)
+openai==0.27.0
 
-# Pinecone Vector Database (Updated package name)
+# Pinecone Vector Database
 pinecone==5.0.0
-
-# FastAPI dependencies (for testtriage integration)
-fastapi==0.104.1
-uvicorn==0.24.0
-pydantic==2.5.0
 
 # Utilities
 python-dotenv==1.0.0
 requests==2.31.0
-typing-extensions==4.8.0
