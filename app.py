@@ -27,13 +27,12 @@ translation_spec.loader.exec_module(translation_module)
 translate_to_language = translation_module.translate_to_language
 translate_to_english = translation_module.translate_to_english
 
-# Configure logging
+# Configure logging for serverless environment (no file logging)
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler("healthmate.log"),
-        logging.StreamHandler()
+        logging.StreamHandler()  # Only console output for Vercel
     ]
 )
 
