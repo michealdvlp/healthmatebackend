@@ -9,13 +9,12 @@ from dotenv import load_dotenv
 # Load environment variables
 load_dotenv()
 
-# Configure logging
+# Configure logging for serverless environment (no file logging)
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler("healthmate.log"),
-        logging.StreamHandler()
+        logging.StreamHandler()  # Only console output for Vercel
     ]
 )
 logger = logging.getLogger("healthmate_awareness")
