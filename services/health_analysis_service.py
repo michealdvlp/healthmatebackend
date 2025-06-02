@@ -33,13 +33,12 @@ SUPPORTED_LANGUAGES = {
     "pcm": "Nigerian Pidgin"
 }
 
-# Configure logging
+# Configure logging for serverless environment (no file logging)
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler("healthmate.log"),
-        logging.StreamHandler()
+        logging.StreamHandler()  # Only console output for Vercel
     ]
 )
 logger = logging.getLogger("healthmate")
@@ -320,20 +319,3 @@ if __name__ == "__main__":
             print(f"\nError: {result.get('message', 'An unknown error occurred')}")
         
         print("\n" + "="*50)
-
-    # Commented test inputs for reference
-    """
-    test_inputs = [
-        "I have a headache and fever for two days",  # English
-        "Isi na-ewute m ruo ụbọchị abụọ",          # Igbo
-        "Mo ni irora ori fun ọjọ meji",             # Yoruba
-        "Ina ciwo a kai tsawon kwana biyu",         # Hausa
-        "I dey get serious headache for two days now"  # Nigerian Pidgin
-    ]
-    
-    for input_text in test_inputs:
-        print("\n" + "="*50)
-        print(f"Testing: {input_text}")
-        result = process_user_message(input_text)
-        print(json.dumps(result, indent=2, ensure_ascii=False))
-    """
